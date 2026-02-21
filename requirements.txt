@@ -1,0 +1,53 @@
+# DreamDiffusion - Modern requirements for Windows compatibility
+# Tested with Python 3.10/3.11 on Windows
+
+# Required by many packages (pkg_resources). 68.x is stable with Python 3.10/3.11 and modern pip.
+    setuptools==68.0.0
+
+# Core ML libraries
+# Note: PyTorch should be installed separately via official instructions
+# For CUDA: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# For CPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+# For now, allow any recent version that's available
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Scientific computing
+# Note: NumPy 2.x is installed with PyTorch 2.7+, which is fine and compatible
+numpy>=1.24.0
+scipy>=1.10.0,<2.0.0
+
+# PyTorch Lightning and related
+pytorch-lightning>=2.0.5,<2.1.0
+torchmetrics>=0.11.0,<1.0.0
+
+# Vision and image processing
+Pillow>=10.0.0,<11.0.0
+opencv-python>=4.8.0,<5.0.0
+scikit-image>=0.21.0,<1.0.0
+kornia>=0.7.0,<1.0.0
+
+# Transformers and CLIP
+transformers>=4.30.0,<5.0.0
+
+# Config and utilities
+omegaconf>=2.3.0,<3.0.0
+einops>=0.6.1,<1.0.0
+tqdm>=4.65.0,<5.0.0
+pyyaml>=6.0,<7.0.0
+
+# Model utilities
+timm>=0.9.0,<1.0.0
+
+# Logging and metrics
+wandb>=0.15.0,<1.0.0
+torch-fidelity>=0.3.0,<1.0.0
+lpips>=0.1.4,<1.0.0
+
+# Data utilities
+natsort>=8.0.0,<9.0.0
+matplotlib>=3.7.0,<4.0.0
+
+# Optional but recommended
+scikit-learn>=1.3.0,<2.0.0
