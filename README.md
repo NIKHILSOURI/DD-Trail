@@ -160,12 +160,12 @@ To **maximize throughput** and GPU utilization:
 | **DataLoader workers** | Avoid CPU bottleneck | `--num_workers 8` (Linux/RunPod; use `0` on Windows). |
 | **Validate less often** | Fewer slow val runs | `--check_val_every_n_epoch 5` |
 | **Fewer val samples** | Shorter val generation | `--val_gen_limit 2` |
-| **torch.compile** (PyTorch 2+) | Faster training step | `--use_compile` (optional; first epoch may be slower). |
+| **torch.compile** | Not used | Disabled for Stage B (validation/generation incompatible). |
 
 **Example (fast run on A100 80GB):**
 
 ```sh
-python code/eeg_ldm.py --num_epoch 10 --batch_size 24 --num_workers 8 --precision bf16 --check_val_every_n_epoch 5 --val_gen_limit 2 --use_compile
+python code/eeg_ldm.py --num_epoch 10 --batch_size 24 --num_workers 8 --precision bf16 --check_val_every_n_epoch 5 --val_gen_limit 2
 ```
 
 Use `--precision 32` if you need full precision (e.g. for debugging).

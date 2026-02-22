@@ -29,27 +29,33 @@ class PLMSSampler(object):
                                                   num_ddpm_timesteps=self.ddpm_num_timesteps,verbose=verbose)
         alphas_cumprod = self.model.alphas_cumprod
         assert alphas_cumprod.shape[0] == self.ddpm_num_timesteps, 'alphas have to be defined for each timestep'
-        to_torch = lambda x: x.clone().detach().to(torch.float32).to(self.model.device)
+        device = self.model.device
+
+        def to_torch(x):
+            if isinstance(x, np.ndarray):
+                return torch.from_numpy(x).float().to(device)
+            return x.clone().detach().to(torch.float32).to(device)
 
         self.register_buffer('betas', to_torch(self.model.betas))
         self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
         self.register_buffer('alphas_cumprod_prev', to_torch(self.model.alphas_cumprod_prev))
 
-        # calculations for diffusion q(x_t | x_{t-1}) and others
-        self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod.cpu())))
-        self.register_buffer('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod.cpu())))
-        self.register_buffer('log_one_minus_alphas_cumprod', to_torch(np.log(1. - alphas_cumprod.cpu())))
-        self.register_buffer('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod.cpu())))
-        self.register_buffer('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod.cpu() - 1)))
+        # use tensor ops so torch.compile/Dynamo can trace; avoid np.sqrt(tensor) -> ndarray
+        ac = alphas_cumprod.to(torch.float32)
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(ac).to(device))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - ac).to(device))
+        self.register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - ac.clamp(min=1e-7)).to(device))
+        self.register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / ac).to(device))
+        self.register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / ac - 1.).to(device))
 
-        # ddim sampling parameters
-        ddim_sigmas, ddim_alphas, ddim_alphas_prev = make_ddim_sampling_parameters(alphacums=alphas_cumprod.cpu(),
+        # ddim sampling parameters (util returns numpy; convert to tensor for device/compile safety)
+        ddim_sigmas, ddim_alphas, ddim_alphas_prev = make_ddim_sampling_parameters(alphacums=alphas_cumprod.cpu().numpy(),
                                                                                    ddim_timesteps=self.ddim_timesteps,
                                                                                    eta=ddim_eta,verbose=verbose)
-        self.register_buffer('ddim_sigmas', ddim_sigmas)
-        self.register_buffer('ddim_alphas', ddim_alphas)
-        self.register_buffer('ddim_alphas_prev', ddim_alphas_prev)
-        self.register_buffer('ddim_sqrt_one_minus_alphas', np.sqrt(1. - ddim_alphas))
+        self.register_buffer('ddim_sigmas', to_torch(ddim_sigmas))
+        self.register_buffer('ddim_alphas', to_torch(ddim_alphas))
+        self.register_buffer('ddim_alphas_prev', to_torch(ddim_alphas_prev))
+        self.register_buffer('ddim_sqrt_one_minus_alphas', to_torch(np.sqrt(1. - ddim_alphas)))
         sigmas_for_original_sampling_steps = ddim_eta * torch.sqrt(
             (1 - self.alphas_cumprod_prev) / (1 - self.alphas_cumprod) * (
                         1 - self.alphas_cumprod / self.alphas_cumprod_prev))

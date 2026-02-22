@@ -271,6 +271,8 @@ def main(config):
             "Install PyTorch with CUDA (e.g. pip install torch --index-url https://download.pytorch.org/whl/cu118) and ensure a GPU is available."
         )
     device = torch.device('cuda')
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        torch.set_float32_matmul_precision('high')  # use Tensor Cores on A100 etc.
     _print_gpu_banner()
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
