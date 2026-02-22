@@ -422,6 +422,7 @@ def get_args_parser():
 
     # finetune parameters
     parser.add_argument('--batch_size', type=int)
+    parser.add_argument('--num_workers', type=int, default=None, help='DataLoader workers; 0=Windows-safe, 4–8 on Linux for faster training')
     parser.add_argument('--lr', type=float)
     parser.add_argument('--num_epoch', type=int)
     parser.add_argument('--precision', type=int)

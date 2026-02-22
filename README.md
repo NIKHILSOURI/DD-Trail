@@ -499,3 +499,27 @@ python code/gen_eval_eeg.py --dataset EEG --model_path pretrains/generation/chec
 
 **Note:** On Windows, always use `python` (not `python3`). The `python3` command may not be available.
 
+
+
+
+python code/eeg_ldm.py \
+  --num_epoch 10 \
+  --val_gen_limit 5 \
+  --model baseline \
+  --use_sarhm false \
+  --run_name baseline_10ep_full_80g \
+  --eval_every 2 \
+  --num_eval_samples 50
+
+
+
+
+  python code/eeg_ldm.py \
+  --num_epoch 10 \
+  --val_gen_limit 5 \
+  --model sarhm \
+  --use_sarhm true \
+  --ablation_mode full_sarhm \
+  --run_name sarhm_10ep_full_80g \
+  --eval_every 2 \
+  --num_eval_samples 50

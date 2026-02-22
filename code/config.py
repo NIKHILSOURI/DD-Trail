@@ -119,13 +119,13 @@ class Config_Generative_Model:
         self.img_size = 512
 
         np.random.seed(self.seed)
-        # finetune parameters (batch_size 4 fits ~16 GB GPU; use --batch_size 8+ for 24 GB)
-        self.batch_size = 5 if self.dataset == 'GOD' else 4
+        # finetune parameters (defaults from original config; for 16 GB GPU use --batch_size 4)
+        self.batch_size = 5 if self.dataset == 'GOD' else 25
         self.lr = 5.3e-5
         self.num_epoch = 500
         
-        self.precision = 16
-        self.accumulate_grad = 6  # effective batch 24 with batch_size 4
+        self.precision = 32
+        self.accumulate_grad = 1
         self.crop_ratio = 0.2
         self.global_pool = False
         self.use_time_cond = True
@@ -134,18 +134,20 @@ class Config_Generative_Model:
         self.subject = 4
         self.eval_avg = True
 
-        # diffusion sampling: 20 = very fast PLMS; 50 = fast; 250 = full quality (1–5 steps = poor quality)
+        # diffusion sampling parameters
         self.num_samples = 5
-        self.ddim_steps = 20
+        self.ddim_steps = 250
         self.HW = None
-        # limit validation generation (items); 2 fits 16 GB GPU, use 5 for 24 GB+)
-        self.val_gen_limit = 2
+        # limit validation generation (items); reduce for 16 GB GPU (e.g. --val_gen_limit 2)
+        self.val_gen_limit = 5
         # limit test set generation after training (e.g. 10 = only 10 images; None = all)
         self.test_gen_limit = 10
         # validate every N epochs (5 = fewer val runs, fits 10 epochs in ~1 h on 16 GB)
         self.check_val_every_n_epoch = 2
         # skip training for epochs < start_epoch (e.g. --start_epoch 2 to test epoch 2 only)
         self.start_epoch = 0
+        # DataLoader: 0 = main process only (Windows-safe); 4–8 on Linux/RunPod for faster GPU feed
+        self.num_workers = 0
         # resume check util
         self.model_meta = None
         self.checkpoint_path = None

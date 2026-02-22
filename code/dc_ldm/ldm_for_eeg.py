@@ -329,9 +329,20 @@ class eLDM:
       
         # # stage one: only optimize conditional encoders
         print('\n##### Stage One: only optimize conditional encoders #####')
-        # num_workers=0 avoids multiprocessing issues on Windows
-        dataloader = DataLoader(dataset, batch_size=bs1, shuffle=True, num_workers=0)
-        test_loader = DataLoader(test_dataset, batch_size=bs1, shuffle=False, num_workers=0)
+        num_workers = getattr(config, 'num_workers', 0) if config else 0
+        use_cuda = next(self.model.parameters()).is_cuda
+        dataloader = DataLoader(
+            dataset, batch_size=bs1, shuffle=True,
+            num_workers=num_workers,
+            pin_memory=use_cuda,
+            persistent_workers=(num_workers > 0),
+        )
+        test_loader = DataLoader(
+            test_dataset, batch_size=bs1, shuffle=False,
+            num_workers=num_workers,
+            pin_memory=use_cuda,
+            persistent_workers=(num_workers > 0),
+        )
         self.model.unfreeze_whole_model()
         self.model.freeze_first_stage()
         self.model.freeze_diffusion_model()
@@ -525,9 +536,20 @@ class eLDM_eval:
       
         # # stage one: only optimize conditional encoders
         print('\n##### Stage One: only optimize conditional encoders #####')
-        # num_workers=0 avoids multiprocessing issues on Windows
-        dataloader = DataLoader(dataset, batch_size=bs1, shuffle=True, num_workers=0)
-        test_loader = DataLoader(test_dataset, batch_size=bs1, shuffle=False, num_workers=0)
+        num_workers = getattr(config, 'num_workers', 0) if config else 0
+        use_cuda = next(self.model.parameters()).is_cuda
+        dataloader = DataLoader(
+            dataset, batch_size=bs1, shuffle=True,
+            num_workers=num_workers,
+            pin_memory=use_cuda,
+            persistent_workers=(num_workers > 0),
+        )
+        test_loader = DataLoader(
+            test_dataset, batch_size=bs1, shuffle=False,
+            num_workers=num_workers,
+            pin_memory=use_cuda,
+            persistent_workers=(num_workers > 0),
+        )
         self.model.unfreeze_whole_model()
         self.model.freeze_first_stage()
         self.model.freeze_diffusion_model()
