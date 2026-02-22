@@ -425,7 +425,7 @@ def get_args_parser():
     parser.add_argument('--num_workers', type=int, default=None, help='DataLoader workers; 0=Windows-safe, 4–8 on Linux for faster training')
     parser.add_argument('--lr', type=float)
     parser.add_argument('--num_epoch', type=int)
-    parser.add_argument('--precision', type=int)
+    parser.add_argument('--precision', default=None, help='32 (full) | 16 (mixed, faster) | bf16 (A100); default 16')
     parser.add_argument('--accumulate_grad', type=int)
     parser.add_argument('--global_pool', type=bool)
 
@@ -449,6 +449,7 @@ def get_args_parser():
     parser.add_argument('--num_eval_samples', type=int, default=50, help='Max samples per dataset for evaluation')
     parser.add_argument('--check_val_every_n_epoch', type=int, default=None, help='Validate every N epochs (e.g. 5 to fit 10 epochs in ~1 h)')
     parser.add_argument('--start_epoch', type=int, default=None, help='Skip training for epochs < this (e.g. 2 to test epoch 2 quickly)')
+    parser.add_argument('--use_compile', action='store_true', help='Use torch.compile (PyTorch 2+) for faster training if available')
 
     # # distributed training parameters
     # parser.add_argument('--local_rank', type=int)
@@ -460,6 +461,13 @@ def update_config(args, config):
         if hasattr(args, attr):
             if getattr(args, attr) != None:
                 setattr(config, attr, getattr(args, attr))
+    # Normalize precision: CLI may pass "16", "32", or "bf16"
+    if hasattr(config, 'precision') and isinstance(getattr(config, 'precision'), str):
+        p = config.precision.strip().lower()
+        if p == 'bf16':
+            config.precision = 'bf16'
+        elif p.isdigit():
+            config.precision = int(p)
     return config
 
 def create_readme(config, path):
@@ -474,9 +482,12 @@ def create_trainer(num_epoch, precision=32, accumulate_grad_batches=2, logger=No
         raise RuntimeError("GPU required. No CUDA device found.")
     # GPU only: use single GPU (device 0)
     acc, devices = 'gpu', 1
-    # Lightning 2.x: use "16-mixed" instead of 16 to avoid deprecation warning
-    if precision == 16:
+    # Lightning 2.x: mixed precision strings
+    if precision == 16 or (isinstance(precision, str) and precision == "16"):
         precision = "16-mixed"
+    elif isinstance(precision, str) and precision.strip().lower() == "bf16":
+        precision = "bf16-mixed"
+    # 32 (or string "32") stays full precision; Lightning accepts 32
     progress_bar = TQDMProgressBar(refresh_rate=1)
     callbacks = [progress_bar]
     if extra_callbacks:

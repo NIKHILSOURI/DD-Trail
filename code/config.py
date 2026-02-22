@@ -124,7 +124,8 @@ class Config_Generative_Model:
         self.lr = 5.3e-5
         self.num_epoch = 500
         
-        self.precision = 32
+        # 16 = mixed precision (faster, less VRAM); 32 = full; "bf16" on A100 for best speed
+        self.precision = 16
         self.accumulate_grad = 1
         self.crop_ratio = 0.2
         self.global_pool = False
@@ -151,6 +152,8 @@ class Config_Generative_Model:
         # resume check util
         self.model_meta = None
         self.checkpoint_path = None
+        # torch.compile (PyTorch 2+) for faster training; enable with --use_compile
+        self.use_compile = False
 
         # Thesis logging / evaluation (optional; set via CLI --run_name, --model, --seed, --eval_every, --num_eval_samples)
         self.run_name = None

@@ -149,6 +149,27 @@ python code/gen_eval_eeg.py --dataset EEG --model_path results/generation/<times
 - **Val gen:** `--val_gen_limit 2` keeps validation generation short. Each run creates a new folder under `results/generation/` (e.g. `13-02-2026-10-11-59`); use that as `<timestamp_baseline>` or `<timestamp_sarhm>` in Stage C.
 - **16GB GPU (CUDA OOM):** Use a smaller batch size so training fits in memory, e.g. `--batch_size 4` (optionally `--accumulate_grad 6` to keep effective batch size similar). You can also set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` before running to reduce fragmentation.
 
+### Faster training (RunPod / A100 / multi-GPU servers)
+
+To **maximize throughput** and GPU utilization:
+
+| Option | Effect | Example |
+|--------|--------|--------|
+| **Mixed precision** | Less VRAM, faster steps | Default is `16` (FP16). On A100 use `--precision bf16`. |
+| **Larger batch** | More GPU utilization | `--batch_size 24` or `32` (tune to fit VRAM). |
+| **DataLoader workers** | Avoid CPU bottleneck | `--num_workers 8` (Linux/RunPod; use `0` on Windows). |
+| **Validate less often** | Fewer slow val runs | `--check_val_every_n_epoch 5` |
+| **Fewer val samples** | Shorter val generation | `--val_gen_limit 2` |
+| **torch.compile** (PyTorch 2+) | Faster training step | `--use_compile` (optional; first epoch may be slower). |
+
+**Example (fast run on A100 80GB):**
+
+```sh
+python code/eeg_ldm.py --num_epoch 10 --batch_size 24 --num_workers 8 --precision bf16 --check_val_every_n_epoch 5 --val_gen_limit 2 --use_compile
+```
+
+Use `--precision 32` if you need full precision (e.g. for debugging).
+
 **Tests:** See [Tests](#tests) for the preflight script and smoke test.
 
 ---

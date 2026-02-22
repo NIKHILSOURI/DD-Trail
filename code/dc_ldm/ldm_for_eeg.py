@@ -364,6 +364,12 @@ class eLDM:
         self.model.learning_rate = lr1
         self.model.train_cond_stage_only = True
         self.model.eval_avg = config.eval_avg
+        if getattr(config, 'use_compile', False) and callable(getattr(torch, 'compile', None)):
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                print("Training with torch.compile (mode=reduce-overhead)")
+            except Exception as e:
+                print("torch.compile skipped:", e)
         trainers.fit(self.model, dataloader, val_dataloaders=test_loader)
 
         self.model.unfreeze_whole_model()
@@ -571,6 +577,12 @@ class eLDM_eval:
         self.model.learning_rate = lr1
         self.model.train_cond_stage_only = True
         self.model.eval_avg = config.eval_avg
+        if getattr(config, 'use_compile', False) and callable(getattr(torch, 'compile', None)):
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                print("Training with torch.compile (mode=reduce-overhead)")
+            except Exception as e:
+                print("torch.compile skipped:", e)
         trainers.fit(self.model, dataloader, val_dataloaders=test_loader)
 
         self.model.unfreeze_whole_model()
