@@ -135,16 +135,18 @@ class Config_Generative_Model:
         self.subject = 4
         self.eval_avg = True
 
-        # diffusion sampling parameters
+        # diffusion sampling parameters (used for Stage C / final eval; thesis metrics use these)
         self.num_samples = 5
         self.ddim_steps = 250
         self.HW = None
-        # limit validation generation (items); reduce for 16 GB GPU (e.g. --val_gen_limit 2)
-        self.val_gen_limit = 5
+        # validation during Stage B (only affects training-time val; Stage C uses num_samples/ddim_steps above)
+        self.val_gen_limit = 2
+        self.val_ddim_steps = 50
+        self.val_num_samples = 2
         # limit test set generation after training (e.g. 10 = only 10 images; None = all)
         self.test_gen_limit = 10
-        # validate every N epochs (5 = fewer val runs, fits 10 epochs in ~1 h on 16 GB)
-        self.check_val_every_n_epoch = 2
+        # validate every N epochs (5 = faster; 2 = more frequent val but slower per epoch)
+        self.check_val_every_n_epoch = 5
         # skip training for epochs < start_epoch (e.g. --start_epoch 2 to test epoch 2 only)
         self.start_epoch = 0
         # DataLoader: 0 = main process only (Windows-safe); 4–8 on Linux/RunPod for faster GPU feed

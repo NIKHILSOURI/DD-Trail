@@ -491,9 +491,10 @@ class DDPM(pl.LightningModule):
                                     
     def full_validation(self, batch, state=None):
         val_limit = getattr(self.main_config, 'val_gen_limit', 5) if getattr(self, 'main_config', None) else 5
-        num_samp = getattr(self.main_config, 'num_samples', 5) if getattr(self, 'main_config', None) else 5
-        print(f'###### run full validation! (limit={val_limit} items, num_samples={num_samp}) ######\n')
-        grid, all_samples, state = self.generate(batch, ddim_steps=self.ddim_steps, num_samples=num_samp, limit=val_limit, state=state)
+        num_samp = getattr(self.main_config, 'val_num_samples', None) or getattr(self.main_config, 'num_samples', 5)
+        ddim_s = getattr(self.main_config, 'val_ddim_steps', None) or self.ddim_steps
+        print(f'###### run full validation! (limit={val_limit} items, num_samples={num_samp}, steps={ddim_s}) ######\n')
+        grid, all_samples, state = self.generate(batch, ddim_steps=ddim_s, num_samples=num_samp, limit=val_limit, state=state)
         metric, metric_list = self.get_eval_metric(all_samples)
         self.save_images(all_samples, suffix='%.4f'%metric[-1])
         metric_dict = {f'val/{k}_full':v for k, v in zip(metric_list, metric)}
@@ -522,12 +523,12 @@ class DDPM(pl.LightningModule):
             return
         
         val_limit = getattr(self.main_config, 'val_gen_limit', 2) if getattr(self, 'main_config', None) else 2
+        num_samp = getattr(self.main_config, 'val_num_samples', None) or getattr(self.main_config, 'num_samples', 3)
+        ddim_s = getattr(self.main_config, 'val_ddim_steps', None) or self.ddim_steps
         if self.validation_count % 5 == 0 and self.trainer.current_epoch != 0:
             self.full_validation(batch)
         else:
-            # pass (use config num_samples for speed: 1–2 = fast, 5 = default)
-            num_samp = getattr(self.main_config, 'num_samples', 3) if getattr(self, 'main_config', None) else 3
-            grid, all_samples, state = self.generate(batch, ddim_steps=self.ddim_steps, num_samples=num_samp, limit=val_limit)
+            grid, all_samples, state = self.generate(batch, ddim_steps=ddim_s, num_samples=num_samp, limit=val_limit)
             metric, metric_list = self.get_eval_metric(all_samples, avg=self.eval_avg)
             grid_imgs = Image.fromarray(grid.astype(np.uint8))
             # self.logger.log_image(key=f'samples_test', images=[grid_imgs])

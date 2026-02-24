@@ -158,9 +158,11 @@ To **maximize throughput** and GPU utilization:
 | **Mixed precision** | Less VRAM, faster steps | Default is `16` (FP16). On A100 use `--precision bf16`. |
 | **Larger batch** | More GPU utilization | `--batch_size 24` or `32` (tune to fit VRAM). |
 | **DataLoader workers** | Avoid CPU bottleneck | `--num_workers 8` (Linux/RunPod; use `0` on Windows). |
-| **Validate less often** | Fewer slow val runs | `--check_val_every_n_epoch 5` |
-| **Fewer val samples** | Shorter val generation | `--val_gen_limit 2` |
+| **Validate less often** | Fewer slow val runs | Default `check_val_every_n_epoch=5`; override with `--check_val_every_n_epoch 10` for even faster. |
+| **Fewer val items/samples/steps** | Shorter val generation | Defaults: `val_gen_limit=2`, `val_ddim_steps=50`, `val_num_samples=2` (validation only; **Stage C** still uses full 250 steps, 5 samples for thesis metrics). |
 | **torch.compile** | Not used | Disabled for Stage B (validation/generation incompatible). |
+
+**Why Stage B was slow:** Each validation run does image generation (PLMS steps × samples × items). Defaults above make validation fast; final thesis numbers come from Stage C with full quality.
 
 **Example (fast run on A100 80GB):**
 
@@ -192,6 +194,9 @@ python code/eeg_ldm.py --run_name my_sarhm --model sarhm --seed 2022 --eval_ever
 - **Artifacts:** For each evaluated dataset, `artifacts/<dataset>/grid_epochXX.png` and optionally `samples/`.
 
 **Evaluation-only (saved checkpoint):** To run evaluation without re-training, load the checkpoint and test dataset, create a run dir and `MetricLogger`, then call the same `evaluate()` used in training (see `code/eval/evaluate.py`). Full metric descriptions and when each applies (e.g. MOABB caveats) are in **`docs/logging.md`**.
+
+**Full command reference (thesis-grade):** See **`docs/thesis_grade_commands.md`**.  
+**Project explainer (config, training vs validation vs inference, timings):** See **`docs/explain.md`**.
 
 ---
 
