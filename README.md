@@ -527,25 +527,24 @@ python code/gen_eval_eeg.py --dataset EEG --model_path pretrains/generation/chec
 
 
 
+Commands you can use
+#Thesis-level (500 epochs, batch 100) – Baseline:
 
-python code/eeg_ldm.py \
-  --num_epoch 10 \
-  --val_gen_limit 5 \
-  --model baseline \
-  --use_sarhm false \
-  --run_name baseline_10ep_full_80g \
-  --eval_every 2 \
-  --num_eval_samples 50
+```sh
+python code/eeg_ldm.py --num_epoch 500 --batch_size 100 --num_workers 8 --precision bf16 --model baseline --seed 2022 --eval_every 2 --num_eval_samples 50 --use_sarhm false
 
 
+#Thesis-level (500 epochs, batch 100) – SAR-HM:
+
+python code/eeg_ldm.py --num_epoch 500 --batch_size 100 --num_workers 8 --precision bf16 --model sarhm --seed 2022 --eval_every 2 --num_eval_samples 50 --use_sarhm true --ablation_mode full_sarhm
 
 
-  python code/eeg_ldm.py \
-  --num_epoch 10 \
-  --val_gen_limit 5 \
-  --model sarhm \
-  --use_sarhm true \
-  --ablation_mode full_sarhm \
-  --run_name sarhm_10ep_full_80g \
-  --eval_every 2 \
-  --num_eval_samples 50
+#10-epoch testing (batch 100) – Baseline:
+
+python code/eeg_ldm.py --num_epoch 10 --batch_size 100 --num_workers 8 --precision bf16 --model baseline --seed 2022 --eval_every 2 --num_eval_samples 50 --use_sarhm false
+
+#10-epoch testing (batch 100) – SAR-HM:
+
+python code/eeg_ldm.py --num_epoch 10 --batch_size 100 --num_workers 8 --precision bf16 --model sarhm --seed 2022 --eval_every 2 --num_eval_samples 50 --use_sarhm true --ablation_mode full_sarhm
+```
+All of this is written in docs/thesis_grade_commands.md with the comparison table and the full command set.
