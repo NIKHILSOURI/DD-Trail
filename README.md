@@ -198,6 +198,52 @@ python code/eeg_ldm.py --run_name my_sarhm --model sarhm --seed 2022 --eval_ever
 **Full command reference (thesis-grade):** See **`docs/thesis_grade_commands.md`**.  
 **Project explainer (config, training vs validation vs inference, timings):** See **`docs/explain.md`**.
 
+### Fast 10-epoch runs (thesis quality)
+
+**10 epochs**, **fast Stage B** (light validation), **full-quality Stage C** (250 steps, 5 samples) for thesis metrics. Run from repo root with venv activated. Replace `<timestamp>` with the run folder name under `results/generation/`.
+
+**Baseline (no SAR-HM):**
+```sh
+python code/eeg_ldm.py --num_epoch 10 \
+  --model baseline --seed 2022 --run_name baseline_10ep \
+  --eval_every 2 --num_eval_samples 50 \
+  --check_val_every_n_epoch 5 --val_gen_limit 2 --val_ddim_steps 50 \
+  --use_sarhm false \
+  --num_workers 4 --batch_size 6
+```
+
+**SAR-HM (full_sarhm):**
+```sh
+python code/eeg_ldm.py --num_epoch 10 \
+  --model sarhm --seed 2022 --run_name sarhm_10ep \
+  --eval_every 2 --num_eval_samples 50 \
+  --check_val_every_n_epoch 5 --val_gen_limit 2 --val_ddim_steps 50 \
+  --use_sarhm true --ablation_mode full_sarhm \
+  --num_workers 4 --batch_size 6
+```
+
+**Stage C (after Stage B; run once per model):**  
+Uses saved config (250 steps, 5 samples) for thesis metrics.
+```sh
+# Baseline
+python code/gen_eval_eeg.py --dataset EEG \
+  --model_path results/generation/<timestamp_baseline>/checkpoint.pth \
+  --splits_path datasets/block_splits_by_image_single.pth \
+  --eeg_signals_path datasets/eeg_5_95_std.pth \
+  --config_patch pretrains/models/config15.yaml
+
+# SAR-HM (same, use SAR-HM timestamp; checkpoint stores use_sarhm/ablation_mode)
+python code/gen_eval_eeg.py --dataset EEG \
+  --model_path results/generation/<timestamp_sarhm>/checkpoint.pth \
+  --splits_path datasets/block_splits_by_image_single.pth \
+  --eeg_signals_path datasets/eeg_5_95_std.pth \
+  --config_patch pretrains/models/config15.yaml
+```
+
+- **16–24 GB GPU:** Use `--batch_size 4` (and optionally `--accumulate_grad 2`).
+- **80 GB GPU:** You can try `--batch_size 12` or `16` and `--num_workers 8` for faster Stage B.
+- **Quality:** Thesis numbers come from Stage C (250 steps, 5 samples). Stage B validation is kept light on purpose.
+
 ---
 
 ## Complete Steps to Run the System
