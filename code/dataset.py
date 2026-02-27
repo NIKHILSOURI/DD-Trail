@@ -288,12 +288,12 @@ class EEGDataset(Dataset):
         # Compute size
         self.size = len(self.data)
         try:
-            self.processor = AutoProcessor.from_pretrained("openai/clip-vit-large-patch14")
+            self.processor = AutoProcessor.from_pretrained("openai/clip-vit-large-patch14", use_fast=True)
         except (OSError, ConnectionError, Exception) as e:
             if "ProxyError" in type(e).__name__ or "connection" in str(e).lower():
                 try:
                     self.processor = AutoProcessor.from_pretrained(
-                        "openai/clip-vit-large-patch14", local_files_only=True
+                        "openai/clip-vit-large-patch14", local_files_only=True, use_fast=True
                     )
                     print("[dataset] Loaded CLIP processor from local cache (offline mode)")
                 except Exception as e2:

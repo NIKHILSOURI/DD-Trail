@@ -81,7 +81,7 @@ def compute_clip_sim_image_image(
     gt_imgs = _to_uint8(gt_imgs)
     try:
         model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
-        processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14", use_fast=True)
     except Exception:
         return out
     from PIL import Image
@@ -126,7 +126,7 @@ def compute_clip_sim_image_text(
         text_prompts = (text_prompts * (len(pred_imgs) // len(text_prompts) + 1))[:len(pred_imgs)]
     try:
         model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
-        processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14", use_fast=True)
     except Exception:
         return out
     from PIL import Image

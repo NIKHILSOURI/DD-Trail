@@ -4,6 +4,9 @@ dreamdiffusion.egg-info/SOURCES.txt
 dreamdiffusion.egg-info/dependency_links.txt
 dreamdiffusion.egg-info/requires.txt
 dreamdiffusion.egg-info/top_level.txt
+eval/__init__.py
+eval/evaluate.py
+eval/metrics.py
 sarhm/__init__.py
 sarhm/metrics_logger.py
 sarhm/prototypes.py

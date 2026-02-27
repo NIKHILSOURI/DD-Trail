@@ -150,7 +150,7 @@ class SpatialSelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module): # Optimize this module as well
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0., cond_scale=1.):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0., cond_scale=1., chunk_size=0):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
@@ -158,6 +158,8 @@ class CrossAttention(nn.Module): # Optimize this module as well
         self.scale = dim_head ** -0.5
         self.heads = heads
         self.cond_scale = cond_scale
+        # chunk_size > 0 enables memory-efficient attention (process query in chunks to avoid O(n^2) allocation)
+        self.chunk_size = chunk_size
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
@@ -172,23 +174,44 @@ class CrossAttention(nn.Module): # Optimize this module as well
 
         q = self.to_q(x)
         context = default(context, x)
-        k = self.to_k(context) 
-        v = self.to_v(context) 
+        k = self.to_k(context)
+        v = self.to_v(context)
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        n_q = q.shape[1]
+        # Use chunked attention when sequence is long or chunk_size was explicitly set, to avoid OOM
+        use_chunked = (self.chunk_size > 0 and n_q > self.chunk_size) or (self.chunk_size <= 0 and n_q > 1024)
+        if use_chunked:
+            chunk_sz = self.chunk_size if self.chunk_size > 0 else 512
+            out_chunks = []
+            for start in range(0, n_q, chunk_sz):
+                end = min(start + chunk_sz, n_q)
+                q_chunk = q[:, start:end, :]  # (b h) c d
+                sim = einsum('b i d, b j d -> b i j', q_chunk, k) * self.scale  # (b h) c n
+                if exists(mask):
+                    mask_cur = rearrange(mask, 'b ... -> b (...)')
+                    max_neg_value = -torch.finfo(sim.dtype).max
+                    mask_cur = repeat(mask_cur, 'b j -> (b h) () j', h=h)
+                    if mask_cur.shape[-1] != sim.shape[2]:
+                        mask_cur = mask_cur[:, :, :sim.shape[2]]
+                    sim = sim.masked_fill_(~mask_cur, max_neg_value)
+                attn = sim.softmax(dim=-1)
+                out_chunk = einsum('b i j, b j d -> b i d', attn, v)
+                out_chunks.append(out_chunk)
+            out = torch.cat(out_chunks, dim=1)
+        else:
+            sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
 
-        if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
-            sim.masked_fill_(~mask, max_neg_value)
+            if exists(mask):
+                mask = rearrange(mask, 'b ... -> b (...)')
+                max_neg_value = -torch.finfo(sim.dtype).max
+                mask = repeat(mask, 'b j -> (b h) () j', h=h)
+                sim.masked_fill_(~mask, max_neg_value)
 
-        # attention, what we cannot get enough of
-        attn = sim.softmax(dim=-1)
+            attn = sim.softmax(dim=-1)
+            out = einsum('b i j, b j d -> b i d', attn, v)
 
-        out = einsum('b i j, b j d -> b i d', attn, v) 
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         return self.to_out(out)
 

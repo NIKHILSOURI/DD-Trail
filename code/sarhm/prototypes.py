@@ -192,7 +192,7 @@ def build_prototypes_clip_text(
     except ImportError:
         raise ImportError("clip_text proto_source requires transformers and CLIP.")
     model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14", use_fast=True)
     model = model.to(device).eval()
     texts = class_names or [f"class {k}" for k in range(num_classes)]
     with torch.no_grad():

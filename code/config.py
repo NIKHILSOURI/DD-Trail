@@ -120,7 +120,8 @@ class Config_Generative_Model:
 
         np.random.seed(self.seed)
         # finetune parameters (defaults from original config; for 16 GB GPU use --batch_size 4)
-        self.batch_size = 5 if self.dataset == 'GOD' else 25
+        # Default 4 avoids OOM in attention (64x64 latent => 4096 tokens; batch 25 needs ~50 GiB for full attn)
+        self.batch_size = 5 if self.dataset == 'GOD' else 4
         self.lr = 5.3e-5
         self.num_epoch = 500
         
