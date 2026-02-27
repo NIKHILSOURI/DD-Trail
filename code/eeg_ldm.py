@@ -6,6 +6,10 @@ os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import warnings
+warnings.filterwarnings("ignore", message=".*pretrained.*deprecated.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*Arguments other than a weight enum.*", category=UserWarning)
+
 import numpy as np
 import torch
 import argparse
@@ -500,7 +504,7 @@ def create_trainer(num_epoch, precision=32, accumulate_grad_batches=2, logger=No
             precision=precision, accumulate_grad_batches=accumulate_grad_batches,
             enable_checkpointing=False, enable_model_summary=False, gradient_clip_val=0.5,
             check_val_every_n_epoch=check_val_every_n_epoch, callbacks=callbacks,
-            log_every_n_steps=10)
+            log_every_n_steps=1)
   
 if __name__ == '__main__':
     args = get_args_parser()

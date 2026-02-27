@@ -141,13 +141,13 @@ class Config_Generative_Model:
         self.ddim_steps = 250
         self.HW = None
         # validation during Stage B (only affects training-time val; Stage C uses num_samples/ddim_steps above)
-        self.val_gen_limit = 2
-        self.val_ddim_steps = 50
-        self.val_num_samples = 2
+        self.val_gen_limit = 1
+        self.val_ddim_steps = 25
+        self.val_num_samples = 1
         # limit test set generation after training (e.g. 10 = only 10 images; None = all)
         self.test_gen_limit = 10
-        # validate every N epochs (5 = faster; 2 = more frequent val but slower per epoch)
-        self.check_val_every_n_epoch = 5
+        # validate every N epochs (10 = fewer val runs for faster Stage B)
+        self.check_val_every_n_epoch = 10
         # skip training for epochs < start_epoch (e.g. --start_epoch 2 to test epoch 2 only)
         self.start_epoch = 0
         # DataLoader: 0 = main process only (Windows-safe); 4–8 on Linux/RunPod for faster GPU feed

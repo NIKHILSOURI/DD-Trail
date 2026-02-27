@@ -266,7 +266,18 @@ class eLDM:
         model = instantiate_from_config(config.model)
         pl_sd = torch.load(self.ckp_path, map_location="cpu", weights_only=False)['state_dict']
 
+        # Remap or drop raw MAE keys (no "cond_stage_model.mae." prefix) to avoid unexpected-key noise
+        def is_raw_mae_key(k):
+            if k in ('cls_token', 'pos_embed', 'mask_token') or k in ('norm.weight', 'norm.bias'):
+                return True
+            if k.startswith('patch_embed.') or k.startswith('blocks.'):
+                return True
+            return False
+        raw_mae_sd = {k: pl_sd.pop(k) for k in list(pl_sd.keys()) if is_raw_mae_key(k)}
+
         m, u = model.load_state_dict(pl_sd, strict=False)
+        if m or u:
+            print(f"LDM checkpoint load: {len(m)} missing, {len(u)} unexpected keys (cond_stage_model replaced below)")
         model.cond_stage_trainable = True
         sarhm_kw = {}
         if main_config is not None:
@@ -288,6 +299,11 @@ class eLDM:
             metafile, num_voxels, self.cond_dim, global_pool=global_pool, clip_tune=clip_tune, cls_tune=cls_tune,
             **sarhm_kw
         )
+        # If checkpoint had raw MAE keys, load them into the conditioner's MAE
+        if raw_mae_sd:
+            m_mae, u_mae = model.cond_stage_model.mae.load_state_dict(raw_mae_sd, strict=False)
+            if m_mae or u_mae:
+                print(f"Cond MAE load from ckpt: {len(m_mae)} missing, {len(u_mae)} unexpected")
         if sarhm_kw.get('use_sarhm'):
             try:
                 from sarhm.metrics_logger import sarhm_metrics_from_extra

@@ -183,8 +183,8 @@ class CrossAttention(nn.Module): # Optimize this module as well
         # Use chunked attention when sequence is long or chunk_size was explicitly set, to avoid OOM
         use_chunked = (self.chunk_size > 0 and n_q > self.chunk_size) or (self.chunk_size <= 0 and n_q > 1024)
         if use_chunked:
-            # Keep chunk small so (batch*heads)*chunk*n fits in VRAM with gradient checkpointing (128 is safe for large batch)
-            chunk_sz = self.chunk_size if self.chunk_size > 0 else 128
+            # Keep chunk small so (batch*heads)*chunk*n fits in VRAM with gradient checkpointing (64 safe for 80GB)
+            chunk_sz = self.chunk_size if self.chunk_size > 0 else 64
             out_chunks = []
             for start in range(0, n_q, chunk_sz):
                 end = min(start + chunk_sz, n_q)

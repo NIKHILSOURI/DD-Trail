@@ -419,10 +419,12 @@ class eeg_encoder(nn.Module):
         else:
             state_dict = {k: v for k, v in state_dict.items() if ('mask_token' not in k)}
         ut.interpolate_pos_embed(self, state_dict)
-            
+
         m, u = self.load_state_dict(state_dict, strict=False)
-        print('missing keys:', u)
-        print('unexpected keys:', m)
+        if m:
+            print(f"MAE load_checkpoint: {len(m)} missing (first 5: {list(m)[:5]})")
+        if u:
+            print(f"MAE load_checkpoint: {len(u)} unexpected (first 5: {list(u)[:5]})")
         return 
 
 class classify_network(nn.Module):
