@@ -400,6 +400,12 @@ def main(config):
     trainer = create_trainer(config.num_epoch, config.precision, config.accumulate_grad, config.logger, check_val_every_n_epoch=check_val, extra_callbacks=extra_callbacks)
     val_limit = getattr(config, 'val_gen_limit', 2)
     print(f'Stage B remaining (approx): {config.num_epoch} epochs, val every {check_val} epoch(s). Full val <={val_limit} items. Progress bars show remaining.\n')
+    if getattr(config, 'disable_image_generation_in_val', False):
+        print('Stage B: skipping image generation during validation (disable_image_generation_in_val=True).\n')
+    elif getattr(config, 'val_image_gen_every_n_epoch', 0) == 0:
+        print('Stage B: skipping image generation during validation (val_image_gen_every_n_epoch=0).\n')
+    elif getattr(config, 'val_image_gen_every_n_epoch', 0) > 0:
+        print(f'Stage B: image generation in validation only every {config.val_image_gen_every_n_epoch} epoch(s).\n')
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     generative_model.finetune(trainer, eeg_latents_dataset_train, eeg_latents_dataset_test,
@@ -457,6 +463,9 @@ def get_args_parser():
     parser.add_argument('--num_eval_samples', type=int, default=50, help='Max samples per dataset for evaluation')
     parser.add_argument('--check_val_every_n_epoch', type=int, default=None, help='Validate every N epochs (e.g. 5 to fit 10 epochs in ~1 h)')
     parser.add_argument('--start_epoch', type=int, default=None, help='Skip training for epochs < this (e.g. 2 to test epoch 2 quickly)')
+    parser.add_argument('--disable_image_generation_in_val', type=str, default=None, choices=['true', 'false'], help='If true, skip PLMS/DDIM image generation during Stage B validation (faster, cheaper). Stage C unchanged.')
+    parser.add_argument('--val_image_gen_every_n_epoch', type=int, default=None, help='Generate images in val only every N epochs; 0 = never. Ignored if disable_image_generation_in_val=true.')
+    parser.add_argument('--resume_ckpt', type=str, default=None, help='Resume from this checkpoint path (same as --checkpoint_path; loads model state and config from .pth)')
     parser.add_argument('--use_compile', action='store_true', help='Use torch.compile (PyTorch 2+) for faster training if available')
 
     # # distributed training parameters
@@ -469,6 +478,12 @@ def update_config(args, config):
         if hasattr(args, attr):
             if getattr(args, attr) != None:
                 setattr(config, attr, getattr(args, attr))
+    # Resume: --resume_ckpt overrides checkpoint_path
+    if getattr(args, 'resume_ckpt', None) is not None:
+        config.checkpoint_path = args.resume_ckpt
+    # Normalize CLI bools
+    if hasattr(args, 'disable_image_generation_in_val') and args.disable_image_generation_in_val is not None:
+        config.disable_image_generation_in_val = (args.disable_image_generation_in_val == 'true')
     # Normalize precision: CLI may pass "16", "32", or "bf16"
     if hasattr(config, 'precision') and isinstance(getattr(config, 'precision'), str):
         p = config.precision.strip().lower()
@@ -522,6 +537,11 @@ if __name__ == '__main__':
         config = model_meta['config']
         config.checkpoint_path = ckp
         print('Resuming from checkpoint: {}'.format(config.checkpoint_path))
+        # Re-apply validation-generation flags so CLI intent is preserved when resuming
+        if getattr(args, 'disable_image_generation_in_val', None) is not None:
+            config.disable_image_generation_in_val = (args.disable_image_generation_in_val == 'true')
+        if getattr(args, 'val_image_gen_every_n_epoch', None) is not None:
+            config.val_image_gen_every_n_epoch = args.val_image_gen_every_n_epoch
 
     output_path = os.path.join(config.output_path, 'results', 'generation',  '%s'%(datetime.datetime.now().strftime("%d-%m-%Y-%H-%M-%S")))
     config.output_path = output_path

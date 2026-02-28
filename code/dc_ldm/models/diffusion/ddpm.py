@@ -490,6 +490,17 @@ class DDPM(pl.LightningModule):
                                     f'{self.validation_count}_{suffix}', f'test{sp_idx}-{copy_idx}.png'))
                                     
     def full_validation(self, batch, state=None):
+        # Skip if image generation is disabled (Stage B only; Stage C does not use this path)
+        main_cfg = getattr(self, 'main_config', None)
+        disable_gen = getattr(main_cfg, 'disable_image_generation_in_val', False) if main_cfg else False
+        val_gen_every_n = getattr(main_cfg, 'val_image_gen_every_n_epoch', 0) if main_cfg else 0
+        current_epoch = self.trainer.current_epoch if (getattr(self, 'trainer', None) is not None) else 0
+        do_image_generation = (not disable_gen) and (val_gen_every_n != 0) and (current_epoch % val_gen_every_n == 0)
+        if not do_image_generation:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return
+        
         val_limit = getattr(self.main_config, 'val_gen_limit', 5) if getattr(self, 'main_config', None) else 5
         num_samp = getattr(self.main_config, 'val_num_samples', None) or getattr(self.main_config, 'num_samples', 5)
         ddim_s = getattr(self.main_config, 'val_ddim_steps', None) or self.ddim_steps
@@ -520,6 +531,21 @@ class DDPM(pl.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         if batch_idx != 0:
+            return
+        
+        # Skip PLMS/DDIM image generation when disabled or not scheduled (faster Stage B; Stage C unchanged)
+        main_cfg = getattr(self, 'main_config', None)
+        disable_gen = getattr(main_cfg, 'disable_image_generation_in_val', False) if main_cfg else False
+        val_gen_every_n = getattr(main_cfg, 'val_image_gen_every_n_epoch', 0) if main_cfg else 0
+        current_epoch = self.trainer.current_epoch if (getattr(self, 'trainer', None) is not None) else 0
+        do_image_generation = (not disable_gen) and (val_gen_every_n != 0) and (current_epoch % val_gen_every_n == 0)
+        
+        if not do_image_generation:
+            rank_zero_only(lambda: print(f'Stage B: skipping image generation during validation (epoch {current_epoch}).'))()
+            self.log('val/skip_image_generation', 1.0, on_step=False, on_epoch=True)
+            self.validation_count += 1
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return
         
         val_limit = getattr(self.main_config, 'val_gen_limit', 2) if getattr(self, 'main_config', None) else 2
