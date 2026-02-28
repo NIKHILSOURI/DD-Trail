@@ -73,27 +73,7 @@ class ExperimentLoggingCallback(pl.Callback):
         if not train_metrics and "train/loss" in cm:
             train_metrics["train/loss_total"] = float(cm["train/loss"].item() if hasattr(cm["train/loss"], "item") else cm["train/loss"])
         self.metric_logger.log_train(step, train_metrics, epoch=epoch)
-        # Run evaluation every eval_every epochs
-        if self.eval_datasets and (epoch + 1) % self.eval_every == 0 and evaluate is not None:
-            for dataset_name, dataset in self.eval_datasets:
-                if dataset is None:
-                    continue
-                try:
-                    evaluate(
-                        self.generative_model,
-                        dataset,
-                        dataset_name,
-                        self.metric_logger,
-                        epoch + 1,
-                        self.run_dir,
-                        self.config,
-                        max_samples=self.num_eval_samples,
-                        save_grid=True,
-                        save_samples=False,
-                        paired_images_available=(dataset_name != "moabb"),
-                    )
-                except Exception as e:
-                    print(f"Eval failed for {dataset_name}: {e}")
+        # Stage B: no PLMS/image generation. Use Stage C (gen_eval_eeg.py / evaluate.py) for generation and metrics.
 
     def on_train_end(self, trainer, pl_module):
         """Close CSV files so all data is flushed."""
