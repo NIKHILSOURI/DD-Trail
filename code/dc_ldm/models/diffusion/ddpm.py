@@ -490,82 +490,23 @@ class DDPM(pl.LightningModule):
                                     f'{self.validation_count}_{suffix}', f'test{sp_idx}-{copy_idx}.png'))
                                     
     def full_validation(self, batch, state=None):
-        # Skip if image generation is disabled (Stage B only; Stage C does not use this path)
-        main_cfg = getattr(self, 'main_config', None)
-        disable_gen = getattr(main_cfg, 'disable_image_generation_in_val', False) if main_cfg else False
-        val_gen_every_n = getattr(main_cfg, 'val_image_gen_every_n_epoch', 0) if main_cfg else 0
-        current_epoch = self.trainer.current_epoch if (getattr(self, 'trainer', None) is not None) else 0
-        do_image_generation = (not disable_gen) and (val_gen_every_n != 0) and (current_epoch % val_gen_every_n == 0)
-        if not do_image_generation:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            return
-        
-        val_limit = getattr(self.main_config, 'val_gen_limit', 5) if getattr(self, 'main_config', None) else 5
-        num_samp = getattr(self.main_config, 'val_num_samples', None) or getattr(self.main_config, 'num_samples', 5)
-        ddim_s = getattr(self.main_config, 'val_ddim_steps', None) or self.ddim_steps
-        print(f'###### run full validation! (limit={val_limit} items, num_samples={num_samp}, steps={ddim_s}) ######\n')
-        grid, all_samples, state = self.generate(batch, ddim_steps=ddim_s, num_samples=num_samp, limit=val_limit, state=state)
-        metric, metric_list = self.get_eval_metric(all_samples)
-        self.save_images(all_samples, suffix='%.4f'%metric[-1])
-        metric_dict = {f'val/{k}_full':v for k, v in zip(metric_list, metric)}
-        # self.logger.log_metrics(metric_dict)
-        grid_imgs = Image.fromarray(grid.astype(np.uint8))
-        # self.logger.log_image(key=f'samples_test_full', images=[grid_imgs])
-        if metric[-1] > self.best_val:
-            self.best_val = metric[-1]
-            # Save pickle-safe config (main_config may contain loggers/file handles)
-            config_save = pickle_safe_config(self.main_config)
-            torch.save(
-                {
-                    'model_state_dict': self.state_dict(),
-                    'config': config_save,
-                    'state': state
-
-                },
-                os.path.join(self.output_path, 'checkpoint_best.pth')
-            )
+        # Stage B: never run PLMS/DDIM (saves time/VRAM). Use Stage C for generation.
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        return
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         if batch_idx != 0:
             return
         
-        # Skip PLMS/DDIM image generation when disabled or not scheduled (faster Stage B; Stage C unchanged)
-        main_cfg = getattr(self, 'main_config', None)
-        disable_gen = getattr(main_cfg, 'disable_image_generation_in_val', False) if main_cfg else False
-        val_gen_every_n = getattr(main_cfg, 'val_image_gen_every_n_epoch', 0) if main_cfg else 0
-        current_epoch = self.trainer.current_epoch if (getattr(self, 'trainer', None) is not None) else 0
-        do_image_generation = (not disable_gen) and (val_gen_every_n != 0) and (current_epoch % val_gen_every_n == 0)
-        
-        if not do_image_generation:
-            rank_zero_only(lambda: print(f'Stage B: skipping image generation during validation (epoch {current_epoch}).'))()
-            self.log('val/skip_image_generation', 1.0, on_step=False, on_epoch=True)
-            self.validation_count += 1
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            return
-        
-        val_limit = getattr(self.main_config, 'val_gen_limit', 2) if getattr(self, 'main_config', None) else 2
-        num_samp = getattr(self.main_config, 'val_num_samples', None) or getattr(self.main_config, 'num_samples', 3)
-        ddim_s = getattr(self.main_config, 'val_ddim_steps', None) or self.ddim_steps
-        if self.validation_count % 5 == 0 and self.trainer.current_epoch != 0:
-            self.full_validation(batch)
-        else:
-            grid, all_samples, state = self.generate(batch, ddim_steps=ddim_s, num_samples=num_samp, limit=val_limit)
-            metric, metric_list = self.get_eval_metric(all_samples, avg=self.eval_avg)
-            grid_imgs = Image.fromarray(grid.astype(np.uint8))
-            # self.logger.log_image(key=f'samples_test', images=[grid_imgs])
-            metric_dict = {f'val/{k}':v for k, v in zip(metric_list, metric)}
-            # self.logger.log_metrics(metric_dict)
-            if metric[-1] > self.run_full_validation_threshold:
-                self.full_validation(batch, state=state)
+        # Stage B: never run PLMS/DDIM during training validation (saves time/VRAM). Use Stage C for generation.
+        rank_zero_only(lambda: print(f'Stage B: skipping image generation during validation (epoch {self.trainer.current_epoch if getattr(self, "trainer", None) else 0}).'))()
+        self.log('val/skip_image_generation', 1.0, on_step=False, on_epoch=True)
         self.validation_count += 1
-        # Free GPU memory before next training step (helps avoid OOM on 16 GB)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        return
 
     def get_eval_metric(self, samples, avg=True):
         metric_list = ['mse', 'pcc', 'ssim', 'psm']

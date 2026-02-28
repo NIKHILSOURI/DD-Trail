@@ -542,6 +542,8 @@ if __name__ == '__main__':
         # Re-apply validation-generation flags so CLI intent is preserved when resuming
         if getattr(args, 'disable_image_generation_in_val', None) is not None:
             config.disable_image_generation_in_val = (args.disable_image_generation_in_val == 'true')
+        else:
+            config.disable_image_generation_in_val = True  # default: no image gen in Stage B when resuming
         if getattr(args, 'val_image_gen_every_n_epoch', None) is not None:
             config.val_image_gen_every_n_epoch = args.val_image_gen_every_n_epoch
 

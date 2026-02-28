@@ -149,7 +149,7 @@ class Config_Generative_Model:
         # validate every N epochs (10 = fewer val runs for faster Stage B)
         self.check_val_every_n_epoch = 10
         # skip image generation during Stage B validation (faster, lower cost); Stage C unchanged
-        self.disable_image_generation_in_val = False
+        self.disable_image_generation_in_val = True
         self.val_image_gen_every_n_epoch = 0  # 0 = never generate in Stage B; N > 0 = generate only every N epochs
         # skip training for epochs < start_epoch (e.g. --start_epoch 2 to test epoch 2 only)
         self.start_epoch = 0
