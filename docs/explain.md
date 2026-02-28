@@ -175,6 +175,7 @@ So: **training** = many steps of forward + loss + backward. **Validation** = a f
 
 - **Entry:** `eLDM.generate(fmri_embedding, num_samples, ddim_steps, HW=None, limit=None, ...)`.  
   `fmri_embedding` is a dataset or list of items; each item has `'eeg'` and optionally `'image'` (for saving GT).
+- **PLMS/DDIM steps:** `ddim_steps` is the **number of denoising steps for one image** (e.g. 250 = high quality/slower, 50 = faster/ slightly lower). It is **not** the number of images; `num_samples` is how many images we generate per EEG.
 - **Per item (up to `limit`):**  
   1. Get EEG latent (and optional GT image).  
   2. Condition the diffusion model on EEG (encoder + mapper + optional SAR-HM).  

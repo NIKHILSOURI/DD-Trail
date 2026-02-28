@@ -1,25 +1,26 @@
+### Make Stage B faster (reduce time per epoch)
 
-### Thesis-level vs 10-epoch testing (Stage B)
+If Stage B is still **~40 min per epoch**, most of that is usually **validation** (PLMS generation) when it runs, plus **many training steps** if batch size is small. You can speed both up without changing final thesis quality (Stage C still uses 250 steps, 5 samples).
 
-| | **Thesis-level (reported results)** | **10-epoch testing (sanity / comparison)** |
-|--|--------------------------------------|--------------------------------------------|
-| **Epochs** | **500** | **10** |
-| **Purpose** | Numbers and figures for thesis; fair Baseline vs SAR-HM comparison. | Quick pipeline check; fast Baseline vs SAR-HM comparison. |
-| **Batch size** | **32–100** on A100 80GB (use 100 if it fits; if OOM, try 48 or 32). Default in config is 25. | Same as thesis-level (e.g. 100 or 32). |
-| **Stage C** | Run Stage C with full `ddim_steps=250`, `num_samples=5` for final metrics. | Same; Stage C defines reported metrics. |
+| Lever | Effect | What to do |
+|-------|--------|------------|
+| **Larger batch size** | Fewer steps per epoch → faster training | Use the largest `--batch_size` that fits (e.g. 32, 48, 100 on A100). |
+| **Validate less often** | Validation runs less often → most epochs are training-only | `--check_val_every_n_epoch 10` or `20`. |
+| **Lighter validation (PLMS)** | Shorter validation when it runs | `--val_gen_limit 1`, `--val_ddim_steps 25`, `--val_num_samples 1`. |
 
-- **Batch size 100:** On A100 80GB you can try `--batch_size 100`; it often fits and shortens wall time. If you get CUDA OOM, use `--batch_size 48` or `--batch_size 32`.
-- **Thesis results:** Use **500 epochs** for any result you report. Use **10 epochs** only for debugging or to show “early training” comparison in the thesis if you want.
+**Learning rate:** If you **increase batch size**, you can scale LR to keep training stable (e.g. linear scaling):  
+`--lr 6.8e-5` for batch 32, or `--lr 2.1e-4` for batch 100 (≈ 5.3e-5 × batch_size/25). Try default `5.3e-5` first; increase slightly if loss is too smooth/slow to converge.
 
-### Stage B: why it was slow and how it’s fixed (same thesis quality)
+**Example – much faster per epoch (A100 80GB):**
+```bash
+# Baseline: large batch, validate every 10 epochs, minimal validation PLMS
+python code/eeg_ldm.py --num_epoch 200 --batch_size 48 --num_workers 8 --precision bf16 --check_val_every_n_epoch 10 --val_gen_limit 1 --val_ddim_steps 25 --val_num_samples 1 --model baseline --seed 2022 --use_sarhm false
 
-**Why one epoch took ~37 min on A100:** Validation during Stage B runs **image generation** (PLMS/DDIM) to compute metrics. With default settings this was: **250 steps × 3–5 samples × 5 items** every 2 epochs, which can take 20–30+ minutes per validation. So most of the “epoch” time was validation, not training.
+# SAR-HM: same
+python code/eeg_ldm.py --num_epoch 200 --batch_size 48 --num_workers 8 --precision bf16 --check_val_every_n_epoch 10 --val_gen_limit 1 --val_ddim_steps 25 --val_num_samples 1 --model sarhm --seed 2022 --use_sarhm true --ablation_mode full_sarhm
+```
 
-**What we changed (no impact on thesis results):**
-- **Validation-only** settings: `val_gen_limit=2`, `val_ddim_steps=50`, `val_num_samples=2`, `check_val_every_n_epoch=5`. These apply only to **training-time validation**. Your **final thesis numbers** come from **Stage C**, which still uses full `ddim_steps=250` and `num_samples=5`.
-- So: Stage B runs much faster per epoch; Stage C and any reported metrics stay at full quality.
-
-**Override from CLI if needed:** `--val_gen_limit`, `--val_ddim_steps`, `--val_num_samples`, `--check_val_every_n_epoch`.
+If 48 fits, try `--batch_size 100` for even fewer steps per epoch. Thesis metrics still come from **Stage C** with full 250 steps and 5 samples.
 
 ---
 
@@ -40,128 +41,20 @@ cp results/eeg_pretrain/<timestamp>/checkpoints/checkpoint.pth pretrains/eeg_pre
 
 ---
 
-## 3. Stage B: Fine-tune LDM (DreamDiffusion)
+### 3c. Very fast 10-epoch run (max speed, good quality)
 
-Stage B trains the EEG-conditioned LDM. For **thesis-grade** runs you want:
-- **Logging:** `--model baseline` or `--model sarhm` (and optionally `--run_name <name>`) so that `runs/<timestamp>_<model>_<seed>/` is created with `config.json`, `train_log.csv`, `eval_log.csv`, and `artifacts/`.
-- **Reproducibility:** Fixed `--seed` (e.g. `2022`).
-- **Evaluation:** `--eval_every 2` and `--num_eval_samples 50` (or your choice) so periodic eval metrics are logged.
+Use these for **10 epochs only**, fastest wall time, while still getting a usable checkpoint for **Stage C with full quality** (Stage C uses 250 steps, 5 samples from the saved config).
 
-### 3a. Baseline (no SAR-HM)
-
-**Thesis-level (500 epochs, batch 100 on A100 80GB):**
+**Baseline (10 epochs, very fast):**
 ```bash
-python code/eeg_ldm.py --num_epoch 500 --batch_size 100 --num_workers 8 --precision bf16 --model baseline --seed 2022 --eval_every 2 --num_eval_samples 50 --use_sarhm false
-```
-*(If OOM, use `--batch_size 48` or `--batch_size 32`.)*
-
-**Thesis-level (500 epochs, default batch 25):**
-```bash
-python code/eeg_ldm.py --num_epoch 500 --model baseline --seed 2022 --eval_every 2 --num_eval_samples 50 --use_sarhm false
+python code/eeg_ldm.py --num_epoch 10 --batch_size 100 --num_workers 8 --precision bf16 --check_val_every_n_epoch 10 --model baseline --seed 2022 --eval_every 2 --num_eval_samples 50 --use_sarhm false
 ```
 
-**10-epoch testing (batch 100 on A100 80GB):**
+**SAR-HM (10 epochs, very fast):**
 ```bash
-python code/eeg_ldm.py --num_epoch 10 --batch_size 100 --num_workers 8 --precision bf16 --model baseline --seed 2022 --eval_every 2 --num_eval_samples 50 --use_sarhm false
+python code/eeg_ldm.py --num_epoch 10 --batch_size 100 --num_workers 8 --precision bf16 --check_val_every_n_epoch 10 --model sarhm --seed 2022 --eval_every 2 --num_eval_samples 50 --use_sarhm true --ablation_mode full_sarhm
 ```
 
-**Explanation:** Trains the original DreamDiffusion path (EEG → MAE → mapper → Stable Diffusion). No Hopfield/SAR-HM. Checkpoint: `results/generation/<timestamp>/checkpoint.pth`. If `--model baseline` is set, thesis logs go to `runs/<timestamp>_baseline_<seed>/`. Use **500 epochs** for thesis-reported results; **10 epochs** only for quick testing.
+- **Speed:** `batch_size 100`, `num_workers 8`, `precision bf16`, `check_val_every_n_epoch 10` (validation runs only once in 10 epochs). If OOM, use `--batch_size 48` or `--batch_size 32`.
+- **Good quality:** After training, run **Stage C** with the checkpoint; it uses **250 PLMS steps** and **5 samples** per EEG from the saved config, so final images and metrics are full quality.
 
-### 3b. SAR-HM (full_sarhm)
-
-**Thesis-level (500 epochs, batch 100 on A100 80GB):**
-```bash
-python code/eeg_ldm.py --num_epoch 500 --batch_size 100 --num_workers 8 --precision bf16 --model sarhm --seed 2022 --eval_every 2 --num_eval_samples 50 --use_sarhm true --ablation_mode full_sarhm
-```
-*(If OOM, use `--batch_size 48` or `--batch_size 32`.)*
-
-**Thesis-level (500 epochs, default batch):**
-```bash
-python code/eeg_ldm.py --num_epoch 500 --model sarhm --seed 2022 --eval_every 2 --num_eval_samples 50 --use_sarhm true --ablation_mode full_sarhm
-```
-
-**10-epoch testing (batch 100 on A100 80GB):**
-```bash
-python code/eeg_ldm.py --num_epoch 10 --batch_size 100 --num_workers 8 --precision bf16 --model sarhm --seed 2022 --eval_every 2 --num_eval_samples 50 --use_sarhm true --ablation_mode full_sarhm
-```
-
-**Explanation:** Trains with SAR-HM (Hopfield + confidence-gated fusion). Same outputs as baseline but with SAR-HM metrics in logs and run folder `runs/<timestamp>_sarhm_<seed>/`. Use the same `--seed` as baseline for fair comparison. Use **500 epochs** for thesis-reported results; **10 epochs** for quick testing.
-
-### 3c. A100 80GB: optional faster settings
-
-Defaults already use fast validation (`val_gen_limit=2`, `val_ddim_steps=50`, `check_val_every_n_epoch=5`). For even faster runs you can use **batch_size 100** (see 3a/3b); if OOM, use 48 or 32. No need to pass `--check_val_every_n_epoch` or `--val_gen_limit` unless you want to override.
-
-### 3d. Tiny dataset (quick baseline vs SAR-HM comparison)
-
-**Create tiny splits once:**
-```bash
-python code/make_tiny_splits.py
-```
-Optional: `--train 200 --test 50` to override default train/test sizes.
-
-**Baseline, 10 epochs, tiny:**
-```bash
-python code/eeg_ldm.py --num_epoch 10 --splits_path datasets/block_splits_tiny.pth --val_gen_limit 2 --model baseline --seed 2022 --use_sarhm false
-```
-
-**SAR-HM, 10 epochs, tiny:**
-```bash
-python code/eeg_ldm.py --num_epoch 10 --splits_path datasets/block_splits_tiny.pth --val_gen_limit 2 --model sarhm --seed 2022 --use_sarhm true --ablation_mode full_sarhm
-```
-
-**Explanation:** Same pipeline on a small subset for fast comparison. Use the corresponding Stage B timestamp in Stage C with `--splits_path datasets/block_splits_tiny.pth`.
-
----
-
-## 4. Stage C: Generate and evaluate
-
-Stage C loads a Stage B checkpoint, generates images on the test set, and computes metrics. Use the **same splits and dataset** as in Stage B.
-
-### 4a. Full dataset (single split)
-
-**Baseline checkpoint:**
-```bash
-python code/gen_eval_eeg.py --dataset EEG --model_path results/generation/<timestamp_baseline>/checkpoint.pth --splits_path datasets/block_splits_by_image_single.pth --eeg_signals_path datasets/eeg_5_95_std.pth --config_patch pretrains/models/config15.yaml
-```
-
-**SAR-HM checkpoint:**
-```bash
-python code/gen_eval_eeg.py --dataset EEG --model_path results/generation/<timestamp_sarhm>/checkpoint.pth --splits_path datasets/block_splits_by_image_single.pth --eeg_signals_path datasets/eeg_5_95_std.pth --config_patch pretrains/models/config15.yaml
-```
-
-**Explanation:** Generates images from EEG test set and evaluates (e.g. SSIM, PCC, FID/IS/CLIP if wired in). Checkpoint contains the config (including SAR-HM), so no extra flags needed for SAR-HM. Outputs: e.g. `results/eval/<timestamp>/`, samples and metrics.
-
-### 4b. Tiny dataset
-
-**Baseline (trained with tiny splits):**
-```bash
-python code/gen_eval_eeg.py --dataset EEG --model_path results/generation/<timestamp_baseline>/checkpoint.pth --splits_path datasets/block_splits_tiny.pth --eeg_signals_path datasets/eeg_5_95_std.pth --config_patch pretrains/models/config15.yaml
-```
-
-**SAR-HM (trained with tiny splits):**
-```bash
-python code/gen_eval_eeg.py --dataset EEG --model_path results/generation/<timestamp_sarhm>/checkpoint.pth --splits_path datasets/block_splits_tiny.pth --eeg_signals_path datasets/eeg_5_95_std.pth --config_patch pretrains/models/config15.yaml
-```
-
-**Explanation:** Same as 4a but with `block_splits_tiny.pth` so test set matches the tiny-split training.
-
-### 4c. All-image splits (if you trained with `block_splits_by_image_all.pth`)
-
-Replace `block_splits_by_image_single.pth` with `block_splits_by_image_all.pth` in the Stage C command; keep everything else the same.
-
----
-
-## Summary table (thesis-grade)
-
-| Step | Purpose | Command (conceptual) |
-|------|---------|----------------------|
-| 0 | One-time setup | `pip install ...` + `pip install -e ./code` |
-| 1 | EEG encoder pretrain | `python code/stageA1_eeg_pretrain.py` (add `--num_epoch 10` for quick) |
-| 2 | Copy A1 → pretrains | `copy/cp ... checkpoint.pth pretrains/eeg_pretain/checkpoint.pth` |
-| 3a | Stage B Baseline | **Thesis-level:** `--num_epoch 500 --batch_size 100 ... --model baseline --use_sarhm false`. **10-epoch testing:** `--num_epoch 10 --batch_size 100 ...` |
-| 3b | Stage B SAR-HM | **Thesis-level:** `--num_epoch 500 --batch_size 100 ... --model sarhm --use_sarhm true --ablation_mode full_sarhm`. **10-epoch testing:** `--num_epoch 10 --batch_size 100 ...` |
-| 4 | Stage C (generate + eval) | `python code/gen_eval_eeg.py --dataset EEG --model_path results/generation/<timestamp>/checkpoint.pth --splits_path ... --eeg_signals_path ... --config_patch ...` |
-
-**Epochs for thesis:** Use **500** for any result you report. Use **10** only for quick testing or “early training” comparison.  
-**Batch size:** **100** on A100 80GB is fine if it fits; else use 48 or 32.  
-**Reproducibility:** Same `--seed`, same splits, same dataset for Baseline vs SAR-HM. For evaluation-only from a saved checkpoint, see `code/eval/evaluate.py` and `docs/logging.md` (if present).
