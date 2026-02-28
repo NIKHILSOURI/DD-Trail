@@ -413,9 +413,11 @@ def main(config):
 
     pbar.update(1)
     pbar.set_description('Generate & evaluate')
-    # generate images
-    # generate limited train images and generate images for subjects seperately
-    generate_images(generative_model, eeg_latents_dataset_train, eeg_latents_dataset_test, config)
+    # Skip post-training image generation when disabled (same flag as val; Stage C does full-quality gen)
+    if getattr(config, 'disable_image_generation_in_val', False):
+        print('Stage B: skipping post-training image generation (disable_image_generation_in_val=True). Run Stage C for full-quality generation.\n')
+    else:
+        generate_images(generative_model, eeg_latents_dataset_train, eeg_latents_dataset_test, config)
     pbar.update(1)
     pbar.set_description('Complete')
     pbar.close()
