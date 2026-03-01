@@ -36,14 +36,19 @@ from tqdm import tqdm
 from config import Config_Generative_Model
 from dataset import create_EEG_dataset
 from dc_ldm.ldm_for_eeg import eLDM_eval
+from utils.state_dict_utils import filter_state_dict_for_model, log_filter_info
 
 
-def find_latest_generation_run(base_dir="exps/results/generation"):
-    """Return path to the newest subdir by mtime, or by datetime in name. base_dir can be absolute or relative to cwd."""
+def find_latest_generation_run(base_dir="exps/results/generation", require_both=False):
+    """Return path to the newest subdir by mtime. If require_both, only consider dirs containing both checkpoint.pth and prototypes.pt."""
     if not os.path.isdir(base_dir):
         return None
     subdirs = [os.path.join(base_dir, d) for d in os.listdir(base_dir)
                if os.path.isdir(os.path.join(base_dir, d))]
+    if require_both:
+        subdirs = [d for d in subdirs
+                   if os.path.isfile(os.path.join(d, 'checkpoint.pth'))
+                   and os.path.isfile(os.path.join(d, 'prototypes.pt'))]
     if not subdirs:
         return None
     def mtime(p):
@@ -146,6 +151,10 @@ def get_args_parser():
                         help='Unconditional conditioning for CFG: zeros or baseline (default zeros).')
     parser.add_argument('--latest_run_dir', type=str, default=None,
                         help='Base dir for generation runs (e.g. exps/results/generation); copy latest to exps/latest/ and use it.')
+    parser.add_argument('--no_auto_use_latest', action='store_true', help='Disable auto-load of prototypes.pt from checkpoint dir (default: auto-load).')
+    parser.add_argument('--latest_root', type=str, default=None,
+                        help='Root to scan for latest run containing checkpoint.pth and prototypes.pt.')
+    parser.add_argument('--prune_unexpected_keys', action='store_true', help='When loading ckpt, drop keys not in model (default False).')
 
     return parser
 
@@ -252,8 +261,18 @@ if __name__ == '__main__':
                 clip_tune=getattr(config, 'clip_tune', True), cls_tune=getattr(config, 'cls_tune', False),
                 main_config=config)
     # ----- DEBUG: Checkpoint load integrity (A) -----
+    model_keys = set(generative_model.model.state_dict().keys())
+    ckpt_raw = sd['model_state_dict']
+    ckpt_sd, filter_info = filter_state_dict_for_model(
+        ckpt_raw,
+        model_state_keys=model_keys,
+        drop_exact_keys=None,
+        drop_prefixes=None,
+        prune_unexpected_keys=getattr(args, 'prune_unexpected_keys', False),
+    )
+    log_filter_info(filter_info, tag='[CKPT_FILTER]')
     try:
-        missing, unexpected = generative_model.model.load_state_dict(sd['model_state_dict'], strict=False)
+        missing, unexpected = generative_model.model.load_state_dict(ckpt_sd, strict=False)
         missing_list = list(missing)
         unexpected_list = list(unexpected)
         print("[DEBUG] [CKPT_LOAD] total missing keys=%d total unexpected keys=%d" % (len(missing_list), len(unexpected_list)))
@@ -278,13 +297,33 @@ if __name__ == '__main__':
             print("[DEBUG] [CKPT_LOAD] cond_ln missing is OK: using random init (checkpoint from run without normalize_conditioning/layernorm).")
     except Exception as e:
         print("[DEBUG] [CKPT_LOAD] load_state_dict failed or no return: %s" % e)
-        generative_model.model.load_state_dict(sd['model_state_dict'], strict=False)
+        generative_model.model.load_state_dict(ckpt_sd, strict=False)
     print('load ldm successfully')
     state = sd.get('state')
     pbar.update(1)
 
-    # ----- Prototype loading (so proto_source is not dummy) -----
+    # ----- Resolve proto_path: explicit, else same dir as checkpoint, else latest_root -----
     proto_path = getattr(args, 'proto_path', None)
+    if not proto_path and not getattr(args, 'no_auto_use_latest', False):
+        ckpt_dir = os.path.dirname(os.path.abspath(args.model_path))
+        candidate = os.path.join(ckpt_dir, 'prototypes.pt')
+        if os.path.isfile(candidate):
+            proto_path = candidate
+            args.proto_path = candidate
+            print("[PROTO] auto_use_latest: using %s" % candidate)
+    if not proto_path and getattr(args, 'latest_root', None):
+        latest_root = os.path.abspath(args.latest_root)
+        run_dir = find_latest_generation_run(latest_root, require_both=True)
+        if run_dir:
+            candidate = os.path.join(run_dir, 'prototypes.pt')
+            if os.path.isfile(candidate):
+                proto_path = candidate
+                args.proto_path = candidate
+                print("[PROTO] latest_root: using %s" % candidate)
+    if not proto_path:
+        proto_path = getattr(args, 'proto_path', None)
+
+    # ----- Prototype loading (so proto_source is not dummy) -----
     csm = getattr(generative_model.model, 'cond_stage_model', None)
     if proto_path and csm is not None:
         if not os.path.isfile(proto_path):
@@ -304,6 +343,8 @@ if __name__ == '__main__':
                             finite = torch.isfinite(P).all().item()
                             print("[DEBUG] [PROTO] loaded path=%s source=loaded shape=%s dtype=%s finite=%s" % (
                                 proto_path, tuple(P.shape), str(P.dtype), finite))
+                            print("[PROTO] using path=%s source=loaded exists=True shape=%s finite=%s" % (
+                                proto_path, tuple(P.shape), finite))
                             print("[DEBUG] [PROTO] P mean=%.6f std=%.6f min=%.6f max=%.6f" % (
                                 p.mean().item(), p.std().item(), p.min().item(), p.max().item()))
                     else:
@@ -314,6 +355,9 @@ if __name__ == '__main__':
                 print("[DEBUG] [PROTO] WARNING: failed to load %s: %s" % (proto_path, e))
     elif proto_path:
         print("[DEBUG] [PROTO] WARNING: proto_path given but cond_stage_model not found")
+
+    if csm is not None and getattr(csm, 'use_sarhm', False) and not csm.has_valid_prototypes():
+        print("[PROTO] missing or invalid -> SAR-HM alpha forced 0 (baseline only)")
 
     # ----- Acceptance: when proto_path was provided, must have valid prototypes and not dummy -----
     if proto_path and csm is not None and getattr(csm, 'use_sarhm', False):
@@ -523,6 +567,25 @@ if __name__ == '__main__':
     grid_imgs.save(os.path.join(output_path, f'./samples_test.png'))
     pbar.update(1)
 
+    # E) Image quality metrics (pair-wise MSE, PCC, SSIM, PSM, top-1-class) for baseline vs SAR-HM comparison
+    eval_metrics_row = None  # if set, block D will use it for ablation_results.csv
+    if samples is not None and len(samples) > 0:
+        try:
+            first = samples[0]
+            if hasattr(first, 'shape') and first.shape[0] >= 2:
+                from eeg_ldm import get_eval_metric
+                metric_vals, metric_names = get_eval_metric(samples, avg=True)
+                if metric_vals and metric_names:
+                    print("[EVAL] " + " ".join("%s=%.4f" % (k, v) for k, v in zip(metric_names, metric_vals)))
+                    mdict = dict(zip(metric_names, metric_vals))
+                    eval_metrics_row = dict(
+                        ssim=mdict.get('ssim'), pcc=mdict.get('pcc'),
+                        retrieval_acc=mdict.get('top-1-class'),
+                    )
+                    print("[EVAL] metrics will be written to ablation_results.csv")
+        except Exception as e:
+            print("[EVAL] metrics failed: %s" % e)
+
     pbar.set_description('Complete')
     pbar.update(1)
     pbar.close()
@@ -534,7 +597,10 @@ if __name__ == '__main__':
             sys.path.insert(0, _code_dir)
         from sarhm.metrics_logger import append_ablation_results_row
         mode = getattr(config, 'ablation_mode', 'baseline') if getattr(config, 'use_sarhm', False) else 'baseline'
-        append_ablation_results_row(run_dir=output_path, mode=mode)
+        kwargs = dict(run_dir=output_path, mode=mode)
+        if eval_metrics_row:
+            kwargs.update(eval_metrics_row)
+        append_ablation_results_row(**kwargs)
         print("ablation_results.csv written under", output_path)
     except Exception as e:
         print("ablation_results skip:", e)

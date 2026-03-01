@@ -34,6 +34,7 @@ from config import Config_Generative_Model
 from dataset import  create_EEG_dataset
 from dc_ldm.ldm_for_eeg import eLDM
 from eval_metrics import get_similarity_metric
+from utils.state_dict_utils import filter_state_dict_for_model, log_filter_info, is_mae_pretrain_ckpt
 
 # Thesis logging and evaluation (optional)
 try:
@@ -270,6 +271,58 @@ def fmri_transform(x, sparse_rate=0.2):
     x_aug[idx] = 0
     return torch.FloatTensor(x_aug)
 
+
+def ensure_prototypes_loaded_or_built(model, config, train_dataset, output_dir, device):
+    """
+    Build or load baseline_centroids prototypes after dataloader/dataset exists, before first forward.
+    Only runs if config.use_sarhm and config.proto_source == 'baseline_centroids'.
+    Validates shape (K, 768), finite, float32. Raises RuntimeError if invalid after build/load.
+    Returns path used.
+    """
+    if not getattr(config, 'use_sarhm', False):
+        return None
+    proto_source = getattr(config, 'proto_source', '') or 'baseline_centroids'
+    if proto_source != 'baseline_centroids':
+        return None
+    from pathlib import Path
+    from torch.utils.data import DataLoader
+    from sarhm.prototypes import build_baseline_centroids
+    csm = model.model.cond_stage_model
+    K = getattr(config, 'num_classes', 40)
+    dim = 768
+    proto_path = getattr(config, 'proto_path', None)
+    if proto_path and os.path.isfile(proto_path):
+        if csm.sarhm_prototypes.load_from_path(proto_path):
+            csm._proto_source = "baseline_centroids"
+            config.proto_path = proto_path
+            path_used = proto_path
+        else:
+            path_used = None
+    else:
+        save_path = os.path.join(output_dir, 'prototypes.pt')
+        os.makedirs(output_dir, exist_ok=True)
+        batch_size_proto = max(1, min(32, len(train_dataset)))
+        loader = DataLoader(train_dataset, batch_size=batch_size_proto, shuffle=False, num_workers=0)
+        build_baseline_centroids(loader, csm, K, dim, device, save_path=save_path)
+        csm.sarhm_prototypes.load_from_path(save_path)
+        csm._proto_source = "baseline_centroids"
+        config.proto_path = save_path
+        path_used = save_path
+        print('[PROTO] built and saved baseline_centroids -> %s' % save_path)
+    if path_used is None and proto_path:
+        raise RuntimeError("[SAR-HM] prototypes load failed from %s (shape mismatch or invalid file). Aborting training." % proto_path)
+    # Validate
+    P = getattr(csm.sarhm_prototypes, 'P', None)
+    if P is None:
+        raise RuntimeError("[SAR-HM] prototypes invalid after build/load (P is None). Aborting training.")
+    if P.shape != (K, dim):
+        raise RuntimeError("[SAR-HM] prototypes invalid shape %s; expected (%d, %d). Aborting training." % (tuple(P.shape), K, dim))
+    if not torch.isfinite(P).all():
+        raise RuntimeError("[SAR-HM] prototypes contain non-finite values. Aborting training.")
+    P.data = P.data.float()
+    return path_used
+
+
 def main(config):
     # GPU only: require CUDA, no CPU fallback
     if not torch.cuda.is_available():
@@ -306,7 +359,7 @@ def main(config):
     if config.dataset == 'EEG':
 
         eeg_latents_dataset_train, eeg_latents_dataset_test = create_EEG_dataset(eeg_signals_path = config.eeg_signals_path, splits_path = config.splits_path,
-                image_transform=[img_transform_train, img_transform_test], subject = config.subject)
+                image_transform=[img_transform_train, img_transform_test], subject = getattr(config, 'subject', 4))
         # eeg_latents_dataset_train, eeg_latents_dataset_test = create_EEG_dataset_viz( image_transform=[img_transform_train, img_transform_test])
         if len(eeg_latents_dataset_train) == 0:
             raise RuntimeError("Training split is empty after filtering. Check splits_path and eeg_signals_path, or relax Splitter filter (e.g. EEG length 450–600).")
@@ -319,6 +372,13 @@ def main(config):
     # print(num_voxels)
 
     # prepare pretrained mbm 
+    pretrain_mbm_path = getattr(config, 'pretrain_mbm_path', None)
+    if not pretrain_mbm_path or not os.path.isfile(pretrain_mbm_path):
+        _def = Config_Generative_Model()
+        pretrain_mbm_path = _def.pretrain_mbm_path
+        config.pretrain_mbm_path = pretrain_mbm_path
+        if not os.path.isfile(pretrain_mbm_path):
+            raise FileNotFoundError('pretrain_mbm_path not found: %s. Set --pretrain_mbm_path (MAE checkpoint).' % pretrain_mbm_path)
     print(f"Loading pretrained checkpoint from: {config.pretrain_mbm_path}")
     pretrain_mbm_metafile = torch.load(config.pretrain_mbm_path, map_location='cpu', weights_only=False)
     print(f"Checkpoint keys: {list(pretrain_mbm_metafile.keys())}")
@@ -334,43 +394,71 @@ def main(config):
                 ddim_steps=config.ddim_steps, global_pool=config.global_pool, use_time_cond=config.use_time_cond,
                 clip_tune=config.clip_tune, cls_tune=config.cls_tune, main_config=config)
 
-    # C1: Build stable prototypes if needed (baseline_centroids or clip_text)
-    if getattr(config, 'use_sarhm', False):
-        proto_source = getattr(config, 'proto_source', 'learnable')
-        csm = generative_model.model.cond_stage_model
-        if proto_source == 'baseline_centroids':
-            default_proto_path = str(Path(config.pretrain_gm_path) / 'prototypes' / 'prototypes_baseline_centroids.pt')
-            proto_path = getattr(config, 'proto_path', None) or default_proto_path
-            if not os.path.isfile(proto_path):
-                from torch.utils.data import DataLoader
-                from sarhm.prototypes import build_baseline_centroids
-                batch_size_proto = max(1, min(32, len(eeg_latents_dataset_train)))
-                loader = DataLoader(eeg_latents_dataset_train, batch_size=batch_size_proto,
-                                   shuffle=False, num_workers=0)
-                build_baseline_centroids(loader, csm, config.num_classes, 768, device, save_path=proto_path)
-                config.proto_path = proto_path
-                csm.sarhm_prototypes.load_from_path(proto_path)
-                csm._proto_source = "baseline_centroids"
-                print(f"Built baseline centroids -> {proto_path}")
-            else:
-                if csm.sarhm_prototypes.load_from_path(proto_path):
-                    csm._proto_source = "baseline_centroids"
-        elif proto_source == 'clip_text':
-            default_proto_path = str(Path(config.pretrain_gm_path) / 'prototypes' / 'prototypes_clip_text.pt')
-            proto_path = getattr(config, 'proto_path', None) or default_proto_path
-            if not os.path.isfile(proto_path):
-                from sarhm.prototypes import build_prototypes_clip_text
-                build_prototypes_clip_text(config.num_classes, 768, device, save_path=proto_path)
-                config.proto_path = proto_path
-            if csm.sarhm_prototypes.load_from_path(proto_path or default_proto_path):
-                csm._proto_source = "clip_text"
-                print(f"Loaded CLIP text prototypes from {proto_path or default_proto_path}")
+    # Resume Stage-B LDM from config.resume_ckpt_path only (MAE loaded above from pretrain_mbm_path).
+    # Only resume_ckpt_path triggers full resume (config + weights). init_from_ckpt is weights-only below.
+    resume_path = getattr(config, 'resume_ckpt_path', None) or getattr(config, 'checkpoint_path', None)
+    if resume_path is not None:
+        model_meta = torch.load(resume_path, map_location='cpu', weights_only=False)
+        if is_mae_pretrain_ckpt(model_meta):
+            raise RuntimeError(
+                "[ERROR] resume_ckpt_path points to a MAE/MBM pretrain checkpoint. "
+                "Use --pretrain_mbm_path for that file and --resume_ckpt_path for Stage-B LDM only."
+            )
+        state_dict = model_meta.get('model_state_dict', model_meta.get('state_dict'))
+        if state_dict is None:
+            print('[CKPT_LOAD] no model_state_dict in checkpoint; skipping load.')
+        else:
+            model_keys = set(generative_model.model.state_dict().keys())
+            filtered_sd, filter_info = filter_state_dict_for_model(
+                state_dict,
+                model_state_keys=model_keys,
+                drop_exact_keys=None,
+                drop_prefixes=None,
+                prune_unexpected_keys=getattr(config, 'prune_unexpected_keys', False),
+            )
+            log_filter_info(filter_info, tag='[CKPT_FILTER]')
+            missing, unexpected = generative_model.model.load_state_dict(filtered_sd, strict=False)
+            n_miss, n_unex = len(missing), len(unexpected)
+            print('[CKPT_LOAD] missing=%d unexpected=%d' % (n_miss, n_unex))
+            sarhm_prefixes = ('cond_stage_model.cond_ln.', 'cond_stage_model.sarhm_projection.',
+                              'cond_stage_model.sarhm_prototypes.prototypes', 'cond_stage_model.sarhm_adapter.')
+            sarhm_missing = [k for k in missing if any(k.startswith(p) for p in sarhm_prefixes)]
+            if sarhm_missing:
+                print('[CKPT_LOAD] SAR-HM keys missing (ok): %s' % (sarhm_missing[:10] if len(sarhm_missing) > 10 else sarhm_missing))
+            if n_miss:
+                print('[CKPT_LOAD] missing (first 20): %s' % list(missing)[:20])
+            if n_unex:
+                print('[CKPT_LOAD] unexpected (first 20): %s' % list(unexpected)[:20])
+            print('model resumed')
 
-    # resume training if applicable
-    if config.checkpoint_path is not None:
-        model_meta = torch.load(config.checkpoint_path, map_location='cpu', weights_only=False)
-        generative_model.model.load_state_dict(model_meta['model_state_dict'])
-        print('model resumed')
+    # Weights-only init (no config/optimizer/epoch): load from init_from_ckpt, start fresh at epoch 0
+    # Only when NOT resuming (resume_ckpt_path not set).
+    init_path = getattr(config, 'init_from_ckpt', None)
+    if resume_path is None and init_path is not None and os.path.isfile(init_path):
+        ckpt = torch.load(init_path, map_location='cpu', weights_only=False)
+        sd = ckpt.get('model_state_dict', ckpt.get('state_dict', ckpt))
+        if sd is None:
+            print('[INIT_CKPT] no model state in %s; skipping' % init_path)
+        else:
+            model_keys = set(generative_model.model.state_dict().keys())
+            filtered_sd, filter_info = filter_state_dict_for_model(
+                sd,
+                model_state_keys=model_keys,
+                drop_exact_keys=None,
+                drop_prefixes=None,
+                prune_unexpected_keys=False,
+            )
+            missing, unexpected = generative_model.model.load_state_dict(filtered_sd, strict=False)
+            print('[INIT_CKPT] loaded weights from %s (strict=False) missing=%d unexpected=%d' % (
+                init_path, len(missing), len(unexpected)))
+        config.start_epoch = 0
+        print('[INIT_CKPT] starting fresh from epoch 0 (no optimizer/scheduler/step loaded).')
+
+    # Prototypes: build or load after dataset exists, before trainer.fit (correct time)
+    if getattr(config, 'use_sarhm', False):
+        ensure_prototypes_loaded_or_built(
+            generative_model, config, eeg_latents_dataset_train, config.output_path, device
+        )
 
     # Thesis logging: run_dir, MetricLogger, eval_datasets
     run_dir = None
@@ -439,8 +527,11 @@ def get_args_parser():
     # project parameters
     parser.add_argument('--root_path', type=str, default=None, help='Repo root; default from config.')
     parser.add_argument('--splits_path', type=str, default=None, help='Override splits file (e.g. datasets/block_splits_tiny.pth)')
-    parser.add_argument('--pretrain_mbm_path', type=str)
-    parser.add_argument('--checkpoint_path', type=str)
+    parser.add_argument('--eeg_signals_path', type=str, default=None, help='Path to EEG signals (e.g. datasets/eeg_5_95_std.pth)')
+    parser.add_argument('--pretrain_mbm_path', type=str, help='EEG encoder/MAE pretrain checkpoint (required for Stage B)')
+    parser.add_argument('--resume_ckpt_path', type=str, default=None, help='Stage-B checkpoint to resume (loads config + weights + trainer state). Only flag that triggers resume.')
+    parser.add_argument('--init_from_ckpt', type=str, default=None, help='Load model weights ONLY from this path; no config/optimizer/epoch. Fresh run from epoch 0.')
+    parser.add_argument('--checkpoint_path', type=str, default=None, help='Deprecated: use --pretrain_mbm_path and --resume_ckpt_path')
     parser.add_argument('--crop_ratio', type=float)
     parser.add_argument('--dataset', type=str)
 
@@ -465,6 +556,13 @@ def get_args_parser():
     parser.add_argument('--test_gen_limit', type=int, default=None, help='Limit test images generated after training (e.g. 5 or 10 for fast; default 10)')
     parser.add_argument('--use_sarhm', type=str, default=None, choices=['true','false'], help='Enable SAR-HM')
     parser.add_argument('--ablation_mode', type=str, default=None, help='baseline|projection_only|hopfield_no_gate|full_sarhm')
+    parser.add_argument('--proto_source', type=str, default=None, help='baseline_centroids|clip_text|learnable')
+    parser.add_argument('--normalize_conditioning', type=str, default=None, choices=['true','false'], help='LayerNorm before fusion (true=layernorm)')
+    parser.add_argument('--warmup_epochs', type=int, default=None, help='Epochs to ramp alpha_max from alpha_max_start to alpha_max_end (default 10)')
+    parser.add_argument('--alpha_max_start', type=float, default=None, help='SAR-HM alpha_max at epoch 0 (default 0.05; keep small early)')
+    parser.add_argument('--alpha_max_end', type=float, default=None, help='SAR-HM alpha_max after warmup (default 0.2)')
+    parser.add_argument('--freeze_diffusion_until_epoch', type=int, default=None, help='Freeze UNet/VAE until this epoch (0=never). Bootstrap: set to num_epoch to train only cond_ln/SAR-HM.')
+    parser.add_argument('--warm_start_from_baseline', type=str, default=None, choices=['true', 'false'], help='If true, init SAR adapter near zero (weights-only). Default false for fresh SAR-HM.')
     parser.add_argument('--clip_tune', type=str, default=None, choices=['true','false'], help='CLIP loss; false saves VRAM, works without ImageNet')
 
     # Thesis logging and evaluation
@@ -482,6 +580,7 @@ def get_args_parser():
     parser.add_argument('--smoke_test', action='store_true', help='Short quality check: val_gen_limit=1, num_samples=4, val_ddim_steps=25, check_val_every_n_epoch=1, val_image_gen_every_n_epoch=1')
     parser.add_argument('--debug', action='store_true', help='Enable debug toggles: debug_cond_stats, debug_vae_roundtrip')
     parser.add_argument('--debug_sampling_steps', type=str, default=None, help='Comma-separated steps to save intermediate val images (e.g. 250,200,150,100,50)')
+    parser.add_argument('--prune_unexpected_keys', action='store_true', help='When loading ckpt, drop keys not in model (default False)')
     # # distributed training parameters
     # parser.add_argument('--local_rank', type=int)
 
@@ -492,9 +591,9 @@ def update_config(args, config):
         if hasattr(args, attr):
             if getattr(args, attr) != None:
                 setattr(config, attr, getattr(args, attr))
-    # Resume: --resume_ckpt overrides checkpoint_path
+    # Resume: --resume_ckpt overrides resume_ckpt_path; --checkpoint_path deprecated (resolved in __main__)
     if getattr(args, 'resume_ckpt', None) is not None:
-        config.checkpoint_path = args.resume_ckpt
+        config.resume_ckpt_path = args.resume_ckpt
     # --smoke_test: short quality check run
     if getattr(args, 'smoke_test', False):
         config.val_gen_limit = 1
@@ -522,6 +621,14 @@ def update_config(args, config):
     # Normalize CLI bools
     if hasattr(args, 'disable_image_generation_in_val') and args.disable_image_generation_in_val is not None:
         config.disable_image_generation_in_val = (args.disable_image_generation_in_val == 'true')
+    if hasattr(args, 'normalize_conditioning') and args.normalize_conditioning is not None:
+        config.normalize_conditioning = (args.normalize_conditioning == 'true')
+    if getattr(args, 'warm_start_from_baseline', None) is not None:
+        config.warm_start_from_baseline = (args.warm_start_from_baseline == 'true')
+    elif getattr(args, 'use_sarhm', False):
+        config.warm_start_from_baseline = False  # default false for SAR-HM fresh runs
+    if getattr(args, 'init_from_ckpt', None) is not None:
+        config.init_from_ckpt = args.init_from_ckpt
     # When validation image gen is enabled, default to every epoch if not set
     if not getattr(config, 'disable_image_generation_in_val', True):
         if getattr(config, 'val_image_gen_every_n_epoch', 0) == 0:
@@ -572,18 +679,58 @@ if __name__ == '__main__':
         args.clip_tune = args.clip_tune == 'true'
     config = Config_Generative_Model()
     config = update_config(args, config)
-    
-    if config.checkpoint_path is not None:
-        model_meta = torch.load(config.checkpoint_path, map_location='cpu', weights_only=False)
-        ckp = config.checkpoint_path
-        config = model_meta['config']
+
+    # Deprecate --checkpoint_path: resolve to pretrain_mbm_path (MAE) or resume_ckpt_path (Stage-B LDM)
+    if getattr(args, 'checkpoint_path', None) is not None:
+        try:
+            peek = torch.load(args.checkpoint_path, map_location='cpu', weights_only=False)
+        except Exception as e:
+            print("[ARGS] WARNING: could not open --checkpoint_path: %s" % e)
+            peek = None
+        if peek is not None and is_mae_pretrain_ckpt(peek):
+            config.pretrain_mbm_path = args.checkpoint_path
+            print("[ARGS] --checkpoint_path looks like MBM/MAE pretrain; using it as --pretrain_mbm_path. Use --resume_ckpt_path for Stage-B resume.")
+        else:
+            config.resume_ckpt_path = args.checkpoint_path
+            print("[ARGS] --checkpoint_path is deprecated; use --resume_ckpt_path.")
+        config.checkpoint_path = args.checkpoint_path  # keep for any legacy reads
+
+    # Load config from Stage-B checkpoint when resuming (so paths/epochs etc. can be restored)
+    if config.resume_ckpt_path is not None:
+        model_meta = torch.load(config.resume_ckpt_path, map_location='cpu', weights_only=False)
+        ckp = config.resume_ckpt_path
+        if is_mae_pretrain_ckpt(model_meta):
+            print("[ERROR] resume_ckpt_path points to a MAE/MBM pretrain checkpoint. Use --pretrain_mbm_path for that file.")
+            sys.exit(1)
+        if 'config' not in model_meta:
+            print('Checkpoint has no "config" key; using current config (only resume_ckpt_path set).')
+        else:
+            config = model_meta['config']
+        config.resume_ckpt_path = ckp
         config.checkpoint_path = ckp
-        print('Resuming from checkpoint: {}'.format(config.checkpoint_path))
-        # Re-apply validation-generation flags so CLI intent is preserved when resuming
+        # Re-apply CLI and fix paths only when we loaded config from checkpoint (e.g. from another machine)
+        if 'config' in model_meta:
+            config = update_config(args, config)
+            default_cfg = Config_Generative_Model()
+            for attr in default_cfg.__dict__:
+                if not hasattr(config, attr):
+                    setattr(config, attr, getattr(default_cfg, attr))
+            config.root_path = default_cfg.root_path
+            config.output_path = default_cfg.output_path
+            if not os.path.isfile(getattr(config, 'pretrain_mbm_path', '')):
+                config.pretrain_mbm_path = default_cfg.pretrain_mbm_path
+                print('Using default pretrain_mbm_path (loaded path not found).')
+            for path_attr in ['eeg_signals_path', 'splits_path', 'pretrain_gm_path', 'pretrain_mbm_path']:
+                p = getattr(config, path_attr, None)
+                if p and not os.path.isabs(p) and not os.path.isfile(p):
+                    resolved = os.path.join(config.root_path, p)
+                    if os.path.isfile(resolved) or os.path.isdir(resolved) or path_attr == 'pretrain_gm_path':
+                        setattr(config, path_attr, resolved)
+            print('Resuming from checkpoint: {}'.format(config.resume_ckpt_path))
         if getattr(args, 'disable_image_generation_in_val', None) is not None:
             config.disable_image_generation_in_val = (args.disable_image_generation_in_val == 'true')
         else:
-            config.disable_image_generation_in_val = True  # default: no image gen in Stage B when resuming
+            config.disable_image_generation_in_val = True
         if getattr(args, 'val_image_gen_every_n_epoch', None) is not None:
             config.val_image_gen_every_n_epoch = args.val_image_gen_every_n_epoch
 

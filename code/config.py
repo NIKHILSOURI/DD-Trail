@@ -160,9 +160,11 @@ class Config_Generative_Model:
         self.debug_sampling_steps = None  # e.g. [250,200,150,100,50] to save intermediates for first val sample
         # DataLoader: 0 = Windows-safe; 4 on Linux to avoid "does not have many workers" warning
         self.num_workers = 4 if os.name != 'nt' else 0
-        # resume check util
+        # resume check util (resume_ckpt_path = Stage-B LDM; checkpoint_path deprecated)
         self.model_meta = None
         self.checkpoint_path = None
+        self.resume_ckpt_path = None
+        self.prune_unexpected_keys = False
         # torch.compile (PyTorch 2+) for faster training; enable with --use_compile
         self.use_compile = False
 

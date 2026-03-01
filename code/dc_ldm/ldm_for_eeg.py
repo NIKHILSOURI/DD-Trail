@@ -220,7 +220,7 @@ class cond_stage_model(nn.Module):
                 valid_proto = False
                 if not getattr(self, '_proto_invalid_warned', False):
                     self._proto_invalid_warned = True
-                    print("[SAR-HM] WARNING: prototypes invalid or missing (proto_source=%s). Forcing alpha=0 (baseline only)." % proto_src)
+                    print("[SAR-HM] invalid prototypes -> alpha forced 0 (baseline only). proto_source=%s" % proto_src)
                 # We still compute c_sar path but will force alpha=0 below
 
             # === SAR-HM path: c_sar then residual fusion c_final = c_base + alpha * (c_sar - c_base) ===
