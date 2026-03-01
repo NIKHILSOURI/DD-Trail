@@ -48,9 +48,10 @@ def compute_alpha_from_attention(
         # entropy: conf = 1 - H(attn)/log(K)
         entropy = -(attn * (attn + eps).log()).sum(dim=-1)
         conf = 1.0 - (entropy / (max_entropy + eps)).clamp(0, 1)
-    conf = conf.clamp(0, 1)
     # Hard fallback: if conf < conf_threshold -> alpha = 0 (pure baseline)
-    alpha = conf.clamp(0, alpha_max).clone()
+    conf = conf.clamp(0, 1)
+    alpha = (alpha_max * conf).clamp(0, alpha_max)
+    alpha = alpha.clone()
     alpha[conf < conf_threshold] = 0.0
     entropy = -(attn * (attn + eps).log()).sum(dim=-1)
     return alpha, conf, entropy

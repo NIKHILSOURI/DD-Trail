@@ -180,15 +180,26 @@ class Config_Generative_Model:
         self.alpha_max = 0.2
         self.conf_threshold = 0.2  # if conf < this -> alpha=0 (pure baseline)
         self.alpha_constant = 0.1  # fallback when alpha_mode=='constant'
-        # Warm start: init SAR adapter so c_sar ~ c_base at epoch 0
+        # Alpha schedule (training): linear warmup from alpha_max_start to alpha_max_end over warmup_epochs
+        self.warmup_epochs = 10
+        self.alpha_max_start = 0.05
+        self.alpha_max_end = 0.2
+        # Conditioning normalization before fusion (match c_base / c_sar scales)
+        self.normalize_conditioning = True
+        self.normalization_type = 'layernorm'  # 'layernorm' | 'l2'
+        self.debug_cond_stats = False  # log mean/std/norms of c_base, c_sar, c_final, alpha, conf
         self.warm_start_from_baseline = True
         # Prototypes: stable memory first
         self.proto_source = 'baseline_centroids'  # 'baseline_centroids' | 'clip_text' | 'learnable'
         self.proto_freeze_epochs = 5
-        # Progressive training
+        # Progressive training (optional)
+        self.freeze_diffusion_until_epoch = 0  # 0 = no freeze; >0 freeze UNet/VAE until this epoch
+        self.train_memory_only_until_epoch = 0  # 0 = off; >0 train only conditioner/memory until this epoch
         self.training_phase = 1  # 0=baseline sanity, 1=proj only, 2=hopfield, 3=proto EMA
         self.enable_hopfield = True
         self.enable_gate = True
+        # Prototype diversity regularization (optional)
+        self.proto_diversity_weight = 0.0  # 1e-3 recommended if learnable prototypes
         # Extra losses (optional)
         self.lambda_stable = 0.1
         self.stable_loss_epochs = 5

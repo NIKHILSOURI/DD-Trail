@@ -1927,30 +1927,25 @@ class EEGClassifier(pl.LightningModule):
 
         c, re_latent = self.get_learned_conditioning(c)
 
-        # loss, loss_dict = self.p_losses(x, c, t, *args, **kwargs)
-        pre_cls = self.cond_stage_model.get_cls(re_latent)
-        # grid, all_samples, state = self.generate(batch, ddim_steps=self.ddim_steps, num_samples=5, limit=None, state=state)
-        # metric, metric_list = self.get_eval_metric(all_samples)
-        # self.save_images(all_samples, suffix='%.4f'%metric[-1])
-        # metric_dict = {f'val/{k}_full':v for k, v in zip(metric_list, metric)}
-        # self.logger.log_metrics(metric_dict)
-        acc1, acc5 = self.accuracy(pre_cls, batch['label'], topk=(1, 5))
-        print(acc1, acc5)
-        # acc1, acc5 = accuracy(output, labels, topk=(1, 5))
-        # grid_imgs = Image.fromarray(grid.astype(np.uint8))
+        # Save checkpoint_best only when classification head is available (cls_tune=True).
+        # With cls_tune=False, get_cls would raise; save best at end of Stage B instead (see finetune).
+        if getattr(self, 'cls_tune', False) and getattr(self.cond_stage_model, 'cls_net', None) is not None:
+            pre_cls = self.cond_stage_model.get_cls(re_latent)
+            acc1, acc5 = self.accuracy(pre_cls, batch['label'], topk=(1, 5))
+            print(acc1, acc5)
+            if acc1[0] > self.best_val:
+                self.best_val = acc1[0]
+                torch.save(
+                    {
+                        'model_state_dict': self.state_dict(),
+                        'config': self.main_config,
+                        'state': state
 
-        # self.logger.log_image(key=f'samples_test_full', images=[grid_imgs])
-        if acc1[0] > self.best_val:
-            self.best_val = acc1[0]
-            torch.save(
-                {
-                    'model_state_dict': self.state_dict(),
-                    'config': self.main_config,
-                    'state': state
-
-                },
-                os.path.join(self.output_path, 'checkpoint_best.pth')
-            )
+                    },
+                    os.path.join(self.output_path, 'checkpoint_best.pth')
+                )
+        else:
+            print('Stage B: skipping classification-based best checkpoint (cls_tune=False). checkpoint_best.pth will be written at end of training if disable_image_generation_in_val=True.\n')
     def get_learned_conditioning(self, c):
         # self.cond_stage_model.eval()
         if isinstance(c, torch.Tensor):

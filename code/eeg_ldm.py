@@ -73,12 +73,29 @@ class ExperimentLoggingCallback(pl.Callback):
         if not train_metrics and "train/loss" in cm:
             train_metrics["train/loss_total"] = float(cm["train/loss"].item() if hasattr(cm["train/loss"], "item") else cm["train/loss"])
         self.metric_logger.log_train(step, train_metrics, epoch=epoch)
+        # Stage B: alpha_max schedule (linear warmup so SAR-HM can beat baseline consistently)
+        config = self.config
+        csm = getattr(self.generative_model.model, "cond_stage_model", None)
+        if csm is not None and getattr(config, "use_sarhm", False):
+            warmup = getattr(config, "warmup_epochs", 10)
+            start = getattr(config, "alpha_max_start", 0.05)
+            end = getattr(config, "alpha_max_end", 0.2)
+            alpha_max_epoch = min(end, start + (epoch / max(warmup, 1)) * (end - start))
+            csm.alpha_max = float(alpha_max_epoch)
         # Stage B: no PLMS/image generation. Use Stage C (gen_eval_eeg.py / evaluate.py) for generation and metrics.
 
     def on_train_end(self, trainer, pl_module):
         """Close CSV files so all data is flushed."""
         if self.metric_logger is not None and hasattr(self.metric_logger, "close"):
             self.metric_logger.close()
+
+    def on_train_start(self, trainer, pl_module):
+        """Set alpha_max to schedule start (epoch 0)."""
+        config = self.config
+        csm = getattr(self.generative_model.model, "cond_stage_model", None)
+        if csm is not None and getattr(config, "use_sarhm", False):
+            start = getattr(config, "alpha_max_start", 0.05)
+            csm.alpha_max = float(start)
 
 
 def wandb_init(config, output_path):

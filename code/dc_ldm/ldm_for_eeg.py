@@ -51,7 +51,8 @@ class cond_stage_model(nn.Module):
                  use_sarhm=False, ablation_mode='baseline', num_classes=40, hopfield_tau=1.0, gate_mode='max',
                  proto_path=None, proto_mode='class',
                  alpha_mode='entropy', alpha_max=0.2, conf_threshold=0.2, alpha_constant=0.1,
-                 warm_start_from_baseline=True):
+                 warm_start_from_baseline=True,
+                 normalize_conditioning=True, normalization_type='layernorm', debug_cond_stats=False):
         super().__init__()
         self.use_sarhm = use_sarhm and _SARHM_AVAILABLE
         self.ablation_mode = ablation_mode if self.use_sarhm else 'baseline'
@@ -62,11 +63,19 @@ class cond_stage_model(nn.Module):
         self._sarhm_extra = {}  # optional diagnostics (attention, confidence, alpha, entropy)
         self._sarhm_header_printed = False
         self._baseline_header_printed = False
+        self._proto_invalid_warned = False
         self.alpha_mode = alpha_mode
-        self.alpha_max = alpha_max
+        self.alpha_max = float(alpha_max)
         self.conf_threshold = conf_threshold
         self.alpha_constant = alpha_constant
         self.warm_start_from_baseline = warm_start_from_baseline
+        self.normalize_conditioning = normalize_conditioning
+        self.normalization_type = normalization_type if normalization_type in ('layernorm', 'l2') else 'layernorm'
+        self.debug_cond_stats = debug_cond_stats
+        if self.normalize_conditioning and self.normalization_type == 'layernorm':
+            self.cond_ln = nn.LayerNorm(768)
+        else:
+            self.cond_ln = None
 
         # prepare pretrained fmri mae
         if metafile is not None:
@@ -157,6 +166,35 @@ class cond_stage_model(nn.Module):
         c = F.interpolate(c, size=target_len, mode='linear', align_corners=False)
         return c.transpose(1, 2)  # [B, target_len, D]
 
+    # -------------------------------------------------------------------------
+    # Baseline residual fusion (ONLY fusion used): c_final = c_base + alpha*(c_sar - c_base).
+    # Cross-attention input: ddpm.apply_model key 'c_crossattn', cond as list [c], shape [B,77,768].
+    # Alpha gating + fallback (invalid prototypes or low confidence -> alpha=0) makes SAR-HM
+    # non-degrading by design: when in doubt, we use baseline only.
+    # -------------------------------------------------------------------------
+
+    def has_valid_prototypes(self):
+        """Return True iff prototypes tensor P exists, shape [K,768], and is finite."""
+        if not self.use_sarhm or getattr(self, 'sarhm_prototypes', None) is None:
+            return False
+        P = getattr(self.sarhm_prototypes, 'P', None)
+        if P is None or not isinstance(P, torch.Tensor):
+            return False
+        if P.ndim != 2:
+            return False
+        K, D = P.shape
+        if D != 768:
+            return False
+        if not torch.isfinite(P).all():
+            return False
+        if P.numel() == 0:
+            return False
+        return True
+
+    def get_proto_source(self):
+        """Return current prototype source string; 'dummy' if never loaded."""
+        return getattr(self, '_proto_source', 'dummy')
+
     def forward(self, x):
         latent_crossattn = self.mae(x)
         latent_return = latent_crossattn
@@ -175,13 +213,22 @@ class cond_stage_model(nn.Module):
                 self._sarhm_extra = {'c_base': c_base, 'alpha': None, 'c_sar': None}
                 return c_base, latent_return
 
+            # Hard fallback: invalid prototypes -> alpha=0 (non-degrading by design)
+            valid_proto = self.has_valid_prototypes()
+            if not valid_proto:
+                if not getattr(self, '_proto_invalid_warned', False):
+                    self._proto_invalid_warned = True
+                    src = self.get_proto_source()
+                    print("[SAR-HM] WARNING: prototypes invalid or missing (proto_source=%s). Forcing alpha=0 (baseline only)." % src)
+                # We still compute c_sar path but will force alpha=0 below
+
             # === SAR-HM path: c_sar then residual fusion c_final = c_base + alpha * (c_sar - c_base) ===
             if not self._sarhm_header_printed:
                 self._sarhm_header_printed = True
-                K = self.sarhm_prototypes.P.shape[0]
+                K = self.sarhm_prototypes.P.shape[0] if getattr(self.sarhm_prototypes, 'P', None) is not None else 0
                 tau = getattr(self.sarhm_hopfield, "tau", 1.0)
                 gate = getattr(self.sarhm_fusion, "gate_mode", "max")
-                proto_src = getattr(self, "_proto_source", "dummy")
+                proto_src = self.get_proto_source()
                 print("SAR-HM ACTIVE | mode=%s | proto_source=%s | K=%s | tau=%s | alpha_mode=%s | alpha_max=%s | conf_threshold=%s" % (
                     self.ablation_mode, proto_src, K, tau, self.alpha_mode, self.alpha_max, self.conf_threshold))
             self._last_mae_latent = latent_crossattn
@@ -196,12 +243,12 @@ class cond_stage_model(nn.Module):
                 z_ret, attn, logits = self.sarhm_hopfield(z_orig, self.sarhm_prototypes)
                 if self.ablation_mode == 'hopfield_no_gate':
                     z_fused = z_ret
-                    confidence = torch.ones(z_orig.shape[0], device=z_orig.device, dtype=z_orig.dtype)
+                    confidence = torch.ones(z_orig.shape[0], device=z_orig.device, dtype=z_orig.dtype) * 0.05
                 else:
                     z_fused, confidence = self.sarhm_fusion(z_orig, z_ret, attn)
             c_sar = self.sarhm_adapter(z_fused)  # [B, 77, cond_dim]
 
-            # A2–A3: Residual fusion; alpha from Hopfield confidence (clamped, fallback)
+            # Alpha from confidence (entropy/max/constant); alpha = alpha_max * conf, conf < conf_threshold -> 0
             if compute_alpha_from_attention is not None and attn is not None:
                 alpha, conf_out, entropy = compute_alpha_from_attention(
                     attn, alpha_mode=self.alpha_mode, alpha_max=self.alpha_max,
@@ -215,15 +262,50 @@ class cond_stage_model(nn.Module):
                 conf_out = confidence
                 entropy = torch.zeros(c_sar.shape[0], device=c_sar.device, dtype=c_sar.dtype)
 
+            if self.ablation_mode == 'hopfield_no_gate':
+                alpha = torch.full((c_sar.shape[0],), 0.05, device=c_sar.device, dtype=c_sar.dtype)
+
+            # Hard fallback: invalid prototypes -> force alpha=0
+            if not valid_proto:
+                alpha = torch.zeros(alpha.shape[0], device=alpha.device, dtype=alpha.dtype)
             # Ablation overrides (Stage C debug flags)
             if getattr(self, "_baseline_only", False):
                 alpha = torch.zeros(alpha.shape[0], device=alpha.device, dtype=alpha.dtype)
             if getattr(self, "_force_alpha", None) is not None:
                 alpha = torch.full((alpha.shape[0],), float(self._force_alpha), device=alpha.device, dtype=alpha.dtype)
 
-            # alpha per sample: [B] -> [B, 1, 1] for broadcasting
-            alpha_bc = alpha.view(-1, 1, 1).to(c_base.dtype)
-            c_final = c_base + alpha_bc * (c_sar - c_base)
+            # Normalize c_base and c_sar before fusion (match scales; reduces distribution mismatch)
+            if self.normalize_conditioning:
+                if self.cond_ln is not None:
+                    c_base_n = self.cond_ln(c_base)
+                    c_sar_n = self.cond_ln(c_sar)
+                else:
+                    eps = 1e-12
+                    c_base_n = F.normalize(c_base, dim=-1, eps=eps)
+                    c_sar_n = F.normalize(c_sar, dim=-1, eps=eps)
+            else:
+                c_base_n = c_base
+                c_sar_n = c_sar
+
+            # Baseline residual fusion anchored on c_base: c_final = c_base_n + alpha*(c_sar_n - c_base_n)
+            alpha_bc = alpha.view(-1, 1, 1).to(c_base_n.dtype)
+            c_final = c_base_n + alpha_bc * (c_sar_n - c_base_n)
+
+            if self.debug_cond_stats:
+                def _stats(t, name):
+                    t = t.float()
+                    return (name, t.mean().item(), t.std().item(), t.min().item(), t.max().item(),
+                            t.norm().item() if t.numel() > 0 else 0.0)
+                cb = _stats(c_base_n, 'c_base')
+                cs = _stats(c_sar_n, 'c_sar')
+                cf = _stats(c_final, 'c_final')
+                ah = alpha.float()
+                print("[COND_STATS] %s mean=%.4f std=%.4f min=%.4f max=%.4f norm=%.4f" % cb)
+                print("[COND_STATS] %s mean=%.4f std=%.4f min=%.4f max=%.4f norm=%.4f" % cs)
+                print("[COND_STATS] %s mean=%.4f std=%.4f min=%.4f max=%.4f norm=%.4f" % cf)
+                print("[COND_STATS] alpha min=%.4f mean=%.4f max=%.4f | conf min=%.4f mean=%.4f max=%.4f | proto_valid=%s" % (
+                    ah.min().item(), ah.mean().item(), ah.max().item(),
+                    conf_out.min().item(), conf_out.mean().item(), conf_out.max().item(), valid_proto))
 
             self._sarhm_extra = {
                 'confidence': conf_out,
@@ -313,6 +395,9 @@ class eLDM:
                 'conf_threshold': getattr(main_config, 'conf_threshold', 0.2),
                 'alpha_constant': getattr(main_config, 'alpha_constant', 0.1),
                 'warm_start_from_baseline': getattr(main_config, 'warm_start_from_baseline', True),
+                'normalize_conditioning': getattr(main_config, 'normalize_conditioning', True),
+                'normalization_type': getattr(main_config, 'normalization_type', 'layernorm'),
+                'debug_cond_stats': getattr(main_config, 'debug_cond_stats', False),
             }
         model.cond_stage_model = cond_stage_model(
             metafile, num_voxels, self.cond_dim, global_pool=global_pool, clip_tune=clip_tune, cls_tune=cls_tune,
@@ -405,15 +490,17 @@ class eLDM:
         self.model.unfreeze_whole_model()
 
         from dc_ldm.util import pickle_safe_config
-        torch.save(
-            {
-                'model_state_dict': self.model.state_dict(),
-                'config': pickle_safe_config(config),
-                'state': torch.random.get_rng_state()
-
-            },
-            os.path.join(output_path, 'checkpoint.pth')
-        )
+        ckpt = {
+            'model_state_dict': self.model.state_dict(),
+            'config': pickle_safe_config(config),
+            'state': torch.random.get_rng_state()
+        }
+        torch.save(ckpt, os.path.join(output_path, 'checkpoint.pth'))
+        # When validation doesn't save checkpoint_best (e.g. cls_tune=False or disable_image_generation_in_val=True),
+        # write checkpoint_best.pth at end of Stage B so downstream scripts that expect it still get a file.
+        if getattr(config, 'disable_image_generation_in_val', False) or not getattr(self.model, 'cls_tune', False):
+            torch.save(ckpt, os.path.join(output_path, 'checkpoint_best.pth'))
+            print('Stage B: saved checkpoint_best.pth (final checkpoint; validation did not run classification-based best save).\n')
         # Save SAR-HM prototypes for reproducibility (checkpoint already contains them)
         if getattr(config, 'use_sarhm', False):
             csm = getattr(self.model, 'cond_stage_model', None)
@@ -422,7 +509,11 @@ class eLDM:
                 if proto_path is None:
                     proto_path = os.path.join(output_path, 'prototypes.pt')
                 os.makedirs(os.path.dirname(proto_path) or '.', exist_ok=True)
-                csm.sarhm_prototypes.save_to_path(proto_path)
+                csm.sarhm_prototypes.save_to_path_with_metadata(
+                    proto_path,
+                    proto_source=getattr(csm, '_proto_source', 'train'),
+                    normalization_type=getattr(csm, 'normalization_type', 'layernorm'),
+                )
                 print(f"SAR-HM prototypes saved to {proto_path}")
 
     @torch.no_grad()
@@ -534,6 +625,9 @@ class eLDM_eval:
                 'conf_threshold': getattr(main_config, 'conf_threshold', 0.2),
                 'alpha_constant': getattr(main_config, 'alpha_constant', 0.1),
                 'warm_start_from_baseline': getattr(main_config, 'warm_start_from_baseline', True),
+                'normalize_conditioning': getattr(main_config, 'normalize_conditioning', True),
+                'normalization_type': getattr(main_config, 'normalization_type', 'layernorm'),
+                'debug_cond_stats': getattr(main_config, 'debug_cond_stats', False),
             }
         model.cond_stage_model = cond_stage_model(
             None, num_voxels, self.cond_dim, global_pool=global_pool, clip_tune=clip_tune, cls_tune=cls_tune,
@@ -613,15 +707,17 @@ class eLDM_eval:
         self.model.unfreeze_whole_model()
 
         from dc_ldm.util import pickle_safe_config
-        torch.save(
-            {
-                'model_state_dict': self.model.state_dict(),
-                'config': pickle_safe_config(config),
-                'state': torch.random.get_rng_state()
-
-            },
-            os.path.join(output_path, 'checkpoint.pth')
-        )
+        ckpt = {
+            'model_state_dict': self.model.state_dict(),
+            'config': pickle_safe_config(config),
+            'state': torch.random.get_rng_state()
+        }
+        torch.save(ckpt, os.path.join(output_path, 'checkpoint.pth'))
+        # When validation doesn't save checkpoint_best (e.g. cls_tune=False or disable_image_generation_in_val=True),
+        # write checkpoint_best.pth at end of Stage B so downstream scripts that expect it still get a file.
+        if getattr(config, 'disable_image_generation_in_val', False) or not getattr(self.model, 'cls_tune', False):
+            torch.save(ckpt, os.path.join(output_path, 'checkpoint_best.pth'))
+            print('Stage B: saved checkpoint_best.pth (final checkpoint; validation did not run classification-based best save).\n')
         # Save SAR-HM prototypes for reproducibility (checkpoint already contains them)
         if getattr(config, 'use_sarhm', False):
             csm = getattr(self.model, 'cond_stage_model', None)
@@ -630,11 +726,16 @@ class eLDM_eval:
                 if proto_path is None:
                     proto_path = os.path.join(output_path, 'prototypes.pt')
                 os.makedirs(os.path.dirname(proto_path) or '.', exist_ok=True)
-                csm.sarhm_prototypes.save_to_path(proto_path)
+                csm.sarhm_prototypes.save_to_path_with_metadata(
+                    proto_path,
+                    proto_source=getattr(csm, '_proto_source', 'train'),
+                    normalization_type=getattr(csm, 'normalization_type', 'layernorm'),
+                )
                 print(f"SAR-HM prototypes saved to {proto_path}")
 
     @torch.no_grad()
-    def generate(self, fmri_embedding, num_samples, ddim_steps, HW=None, limit=None, state=None, output_path = None):
+    def generate(self, fmri_embedding, num_samples, ddim_steps, HW=None, limit=None, state=None, output_path=None,
+                 cfg_scale=1.0, cfg_uncond='zeros'):
         # fmri_embedding: n, seq_len, embed_dim
         all_samples = []
         if HW is None:
@@ -647,7 +748,6 @@ class eLDM_eval:
 
         model = self.model.to(self.device)
         sampler = PLMSSampler(model)
-        # sampler = DDIMSampler(model)
         if state is not None:
             try:
                 torch.cuda.set_rng_state(state)
@@ -675,15 +775,24 @@ class eLDM_eval:
                 if isinstance(gt_image, np.ndarray):
                     gt_image = torch.from_numpy(gt_image).float().to(self.device)
                 wrap.set_description(f'Generate test (item {count+1}/{total_items}, {ddim_steps} steps)')
-                # assert latent.shape[-1] == self.fmri_latent_dim, 'dim error'
                 latent_rep = repeat(latent, 'h w -> c h w', c=num_samples)
                 c, re_latent = model.get_learned_conditioning(latent_rep)
-                # c = model.get_learned_conditioning(repeat(latent, 'h w -> c h w', c=num_samples).to(self.device))
+                # CFG: unconditional conditioning tensor [B,77,768] for PLMS torch.cat([uc, c])
+                uc = None
+                if cfg_scale != 1.0:
+                    c_tensor = c if isinstance(c, torch.Tensor) else c[list(c.keys())[0]][0]
+                    dtype, dev = c_tensor.dtype, c_tensor.device
+                    if cfg_uncond == 'zeros':
+                        uc = torch.zeros(num_samples, 77, 768, device=dev, dtype=dtype)
+                    else:
+                        uc = c_tensor.detach().clone()
                 samples_ddim, _ = sampler.sample(S=ddim_steps, 
                                                 conditioning=c,
                                                 batch_size=num_samples,
                                                 shape=shape,
-                                                verbose=False)
+                                                verbose=False,
+                                                unconditional_guidance_scale=cfg_scale,
+                                                unconditional_conditioning=uc)
 
                 x_samples_ddim = model.decode_first_stage(samples_ddim)
                 x_samples_ddim = torch.clamp((x_samples_ddim+1.0)/2.0, min=0.0, max=1.0)

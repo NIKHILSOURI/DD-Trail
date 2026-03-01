@@ -48,5 +48,6 @@ All diagnostic lines are tagged so you can search for `[DEBUG]`.
 3. **`[SCALE_FACTOR] match=True`**.
 4. **`[COND]`** – no NaN/Inf; c_final/c_base in a reasonable range (e.g. mean near 0, std on the order of 0.1–1).
 5. **`vae_roundtrip.png`** looks like a blurred but recognizable version of the test image, not noise or a flat field.
+6. **Prototypes at Stage C:** The checkpoint already contains the **trained** prototypes (same as the run’s `prototypes.pt`). If you pass `--proto_path`, use the **run’s** `prototypes.pt` (e.g. next to `checkpoint.pth`), **not** `prototypes_baseline_centroids.pt`. Using baseline centroids at inference overwrites the trained prototypes and causes wrong Hopfield retrieval → noisy images. To use the checkpoint’s prototypes, omit `--proto_path` or set it to the same run folder’s `prototypes.pt`.
 
 If any of these fail, fix that part before blaming the sampling loop.

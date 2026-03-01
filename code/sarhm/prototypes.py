@@ -73,6 +73,37 @@ class ClassPrototypes(nn.Module):
         torch.save({"prototypes": self.prototypes.detach().cpu()}, path)
         return path
 
+    def save_to_path_with_metadata(
+        self,
+        path: Optional[str] = None,
+        proto_source: str = "train",
+        normalization_type: str = "layernorm",
+        **extra_meta,
+    ) -> str:
+        path = path or self.proto_path
+        if path is None:
+            path = "prototypes.pt"
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        import time
+        K, D = self.prototypes.shape
+        meta = {
+            "K": K,
+            "dim": D,
+            "proto_source": proto_source,
+            "normalization_type": normalization_type,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+            **extra_meta,
+        }
+        try:
+            import subprocess
+            r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=2)
+            if r.returncode == 0 and r.stdout:
+                meta["git_hash"] = r.stdout.strip()[:12]
+        except Exception:
+            meta["git_hash"] = None
+        torch.save({"prototypes": self.prototypes.detach().cpu(), "metadata": meta}, path)
+        return path
+
     def update_from_batch(
         self,
         embeddings: torch.Tensor,

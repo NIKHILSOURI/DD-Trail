@@ -6,22 +6,22 @@ Usage (full eval):
     --splits_path datasets/block_splits_by_image_single.pth \\
     --eeg_signals_path datasets/eeg_5_95_std.pth --config_patch pretrains/models/config15.yaml
 
-Mini run (fast debug, N images only):
-  python code/gen_eval_eeg.py --dataset EEG --model_path <ckpt.pth> \\
-    --splits_path ... --eeg_signals_path ... --config_patch pretrains/models/config15.yaml \\
-    --max_items 10
-  Or: --max_train_items 5 --max_test_items 10
+Minimal Stage C (20 images):
+  python code/gen_eval_eeg.py --dataset EEG --model_path <ckpt.pth> ... --num_samples 20 --split test
 
-Load real prototypes (so proto_source is not "dummy"):
-  python code/gen_eval_eeg.py ... --proto_path pretrains/prototypes/prototypes_baseline_centroids.pt
+Load real prototypes (required for SAR-HM; use run's prototypes.pt, not baseline_centroids):
+  python code/gen_eval_eeg.py ... --proto_path exps/results/generation/28-02-2026-21-42-16/prototypes.pt
 
-Ablations:
-  --no_sarhm          force SAR-HM off (baseline conditioning only)
-  --baseline_only     use alpha=0 (baseline-only fusion)
-  --force_alpha 0.2   fix alpha to 0.2 for all samples (-1 to disable)
-  --debug             extra prints + VAE roundtrip saved to figures/vae_roundtrip.png
+Or use latest run: --latest_run_dir exps/results/generation → copies to exps/latest/ and uses that.
+
+Ablations: --ablation baseline | projection_only | hopfield_no_gate | full
+  --no_sarhm / --disable_sarhm  force baseline
+  --baseline_only   alpha=0
+  --force_alpha 0.2   fix alpha
+  --debug   extra logs + VAE roundtrip
 """
 import os, sys
+import shutil
 import numpy as np
 import torch
 from einops import rearrange
@@ -36,6 +36,23 @@ from tqdm import tqdm
 from config import Config_Generative_Model
 from dataset import create_EEG_dataset
 from dc_ldm.ldm_for_eeg import eLDM_eval
+
+
+def find_latest_generation_run(base_dir="exps/results/generation"):
+    """Return path to the newest subdir by mtime, or by datetime in name. base_dir can be absolute or relative to cwd."""
+    if not os.path.isdir(base_dir):
+        return None
+    subdirs = [os.path.join(base_dir, d) for d in os.listdir(base_dir)
+               if os.path.isdir(os.path.join(base_dir, d))]
+    if not subdirs:
+        return None
+    def mtime(p):
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return 0
+    return max(subdirs, key=mtime)
+
 
 def to_image(img):
     if img.shape[-1] != 3:
@@ -106,6 +123,29 @@ def get_args_parser():
                         help='Equivalent to alpha=0 (no SAR-HM fusion).')
     parser.add_argument('--debug', action='store_true',
                         help='Extra prints and VAE roundtrip saved to figures/vae_roundtrip.png.')
+    parser.add_argument('--num_samples', type=int, default=20,
+                        help='Number of samples per EEG (default 20 for minimal run).')
+    parser.add_argument('--split', type=str, default='test', choices=['test', 'train'],
+                        help='Which split to generate (default test).')
+    parser.add_argument('--start_index', type=int, default=0,
+                        help='Start index into dataset (default 0).')
+    parser.add_argument('--save_intermediates', action='store_true',
+                        help='Save decoded images at intermediate steps (if supported).')
+    parser.add_argument('--ablation', type=str, default='full',
+                        choices=['baseline', 'projection_only', 'hopfield_no_gate', 'full'],
+                        help='Ablation mode (default full).')
+    parser.add_argument('--conf_threshold', type=float, default=None,
+                        help='Override conf_threshold (if conf < this, alpha=0).')
+    parser.add_argument('--alpha_max', type=float, default=None,
+                        help='Override alpha_max.')
+    parser.add_argument('--disable_sarhm', action='store_true',
+                        help='Same as --no_sarhm: force baseline only.')
+    parser.add_argument('--cfg_scale', type=float, default=1.0,
+                        help='Classifier-free guidance scale (default 1.0 = no CFG).')
+    parser.add_argument('--cfg_uncond', type=str, default='zeros', choices=['zeros', 'baseline'],
+                        help='Unconditional conditioning for CFG: zeros or baseline (default zeros).')
+    parser.add_argument('--latest_run_dir', type=str, default=None,
+                        help='Base dir for generation runs (e.g. exps/results/generation); copy latest to exps/latest/ and use it.')
 
     return parser
 
@@ -115,6 +155,30 @@ if __name__ == '__main__':
     args = args.parse_args()
     root = args.root
     target = args.dataset
+
+    # Optional: use latest run from generation dir and copy to exps/latest/
+    if getattr(args, 'latest_run_dir', None):
+        base = os.path.abspath(args.latest_run_dir)
+        run_dir = find_latest_generation_run(base)
+        if run_dir is None:
+            print("[DEBUG] [LATEST] No subdirs in %s; ignoring --latest_run_dir" % base)
+        else:
+            latest_dir = os.path.join(root, 'exps', 'latest')
+            os.makedirs(latest_dir, exist_ok=True)
+            ckpt_src = os.path.join(run_dir, 'checkpoint.pth')
+            proto_src = os.path.join(run_dir, 'prototypes.pt')
+            for src, name in [(ckpt_src, 'checkpoint.pth'), (proto_src, 'prototypes.pt')]:
+                if os.path.isfile(src):
+                    dst = os.path.join(latest_dir, name)
+                    shutil.copy2(src, dst)
+                    print("[DEBUG] [LATEST] copied %s -> %s" % (src, dst))
+            if os.path.isfile(ckpt_src):
+                args.model_path = os.path.join(latest_dir, 'checkpoint.pth')
+            if os.path.isfile(proto_src):
+                args.proto_path = os.path.join(latest_dir, 'prototypes.pt')
+
+    if getattr(args, 'disable_sarhm', False):
+        args.no_sarhm = True
 
     # Check if model path exists
     if not os.path.exists(args.model_path):
@@ -232,9 +296,11 @@ if __name__ == '__main__':
                         P = csm.sarhm_prototypes.P
                         if P is not None:
                             p = P.float()
-                            print("[DEBUG] [PROTO] P shape=%s dtype=%s mean=%.6f std=%.6f min=%.6f max=%.6f" % (
-                                tuple(P.shape), P.dtype, p.mean().item(), p.std().item(), p.min().item(), p.max().item()))
-                        print("[DEBUG] [PROTO] loaded %s -> proto_source=loaded" % proto_path)
+                            finite = torch.isfinite(P).all().item()
+                            print("[DEBUG] [PROTO] loaded path=%s source=loaded shape=%s dtype=%s finite=%s" % (
+                                proto_path, tuple(P.shape), str(P.dtype), finite))
+                            print("[DEBUG] [PROTO] P mean=%.6f std=%.6f min=%.6f max=%.6f" % (
+                                p.mean().item(), p.std().item(), p.min().item(), p.max().item()))
                     else:
                         print("[DEBUG] [PROTO] WARNING: load_from_path returned False for %s (shape mismatch or invalid file)" % proto_path)
                 else:
@@ -244,15 +310,38 @@ if __name__ == '__main__':
     elif proto_path:
         print("[DEBUG] [PROTO] WARNING: proto_path given but cond_stage_model not found")
 
+    # ----- Acceptance: when proto_path was provided, must have valid prototypes and not dummy -----
+    if proto_path and csm is not None and getattr(csm, 'use_sarhm', False):
+        valid = csm.has_valid_prototypes()
+        src = csm.get_proto_source()
+        if not valid:
+            print("[DEBUG] [PROTO] *** ASSERTION: proto_path provided but has_valid_prototypes()=False. Fix proto file or use --baseline_only.")
+        if src == "dummy":
+            print("[DEBUG] [PROTO] *** ASSERTION: proto_path provided but proto_source still dummy. Load failed or path wrong.")
+        # Optional strict assert (can be disabled for debugging):
+        if getattr(args, 'debug', False):
+            assert valid, "proto_path set but has_valid_prototypes() is False"
+            assert src != "dummy", "proto_path set but proto_source is still dummy"
+
     # ----- Ablation flags (no_sarhm, baseline_only, force_alpha) -----
     if csm is not None:
         csm._no_sarhm = getattr(args, 'no_sarhm', False)
         csm._baseline_only = getattr(args, 'baseline_only', False)
         csm._force_alpha = float(args.force_alpha) if getattr(args, 'force_alpha', -1) >= 0 else None
+        csm.debug_cond_stats = getattr(args, 'debug', False) or getattr(config, 'debug_cond_stats', False)
+        if getattr(args, 'conf_threshold', None) is not None:
+            csm.conf_threshold = float(args.conf_threshold)
+        if getattr(args, 'alpha_max', None) is not None:
+            csm.alpha_max = float(args.alpha_max)
+        ab = getattr(args, 'ablation', 'full')
+        if ab == 'baseline':
+            csm._baseline_only = True
+        else:
+            csm.ablation_mode = {'projection_only': 'projection_only', 'hopfield_no_gate': 'hopfield_no_gate', 'full': 'full_sarhm'}.get(ab, 'full_sarhm')
 
     # ----- Warn if proto_source is dummy and SAR-HM is on -----
     if csm is not None and getattr(csm, 'use_sarhm', False) and not getattr(csm, '_no_sarhm', False):
-        ps = getattr(csm, '_proto_source', 'dummy')
+        ps = csm.get_proto_source() if hasattr(csm, 'get_proto_source') else getattr(csm, '_proto_source', 'dummy')
         if ps == 'dummy':
             print("[DEBUG] [PROTO] *** WARNING: proto_source=dummy and SAR-HM is ON. Provide --proto_path <prototypes.pt> for real prototypes, or use --baseline_only / --no_sarhm for safe debug.")
             if getattr(args, 'debug', False):
@@ -384,13 +473,18 @@ if __name__ == '__main__':
             print('attention plot skip:', e)
 
     pbar.set_description('Generate train')
+    num_samples = getattr(args, 'num_samples', None) or getattr(config, 'num_samples', 5)
+    split = getattr(args, 'split', 'test')
+    start_index = getattr(args, 'start_index', 0)
+    cfg_scale = getattr(args, 'cfg_scale', 1.0)
+    cfg_uncond = getattr(args, 'cfg_uncond', 'zeros')
     limit_train = 10
     if getattr(args, 'max_train_items', None) is not None:
         limit_train = args.max_train_items
     elif getattr(args, 'max_items', None) is not None:
         limit_train = args.max_items
-    grid, _ = generative_model.generate(dataset_train, config.num_samples,
-                config.ddim_steps, config.HW, limit_train)
+    grid, _ = generative_model.generate(dataset_train, num_samples,
+                config.ddim_steps, config.HW, limit_train, cfg_scale=cfg_scale, cfg_uncond=cfg_uncond)
     grid_imgs = Image.fromarray(grid.astype(np.uint8))
     grid_imgs.save(os.path.join(output_path, f'./samples_train.png'))
     pbar.update(1)
@@ -401,8 +495,21 @@ if __name__ == '__main__':
         limit_test = args.max_test_items
     elif getattr(args, 'max_items', None) is not None:
         limit_test = args.max_items
-    grid, samples = generative_model.generate(dataset_test, config.num_samples,
-                config.ddim_steps, config.HW, limit=limit_test, state=state, output_path=output_path)
+    # Optional: use only a slice of the dataset (start_index, start_index+limit_test)
+    ds_test = dataset_test
+    if start_index > 0 and hasattr(dataset_test, '__getitem__'):
+        try:
+            from torch.utils.data import Subset
+            n = len(dataset_test)
+            indices = list(range(start_index, min(start_index + (limit_test or n), n)))
+            if indices:
+                ds_test = Subset(dataset_test, indices)
+                limit_test = None  # generate all of the subset
+        except Exception:
+            pass
+    grid, samples = generative_model.generate(ds_test, num_samples,
+                config.ddim_steps, config.HW, limit=limit_test, state=state, output_path=output_path,
+                cfg_scale=cfg_scale, cfg_uncond=cfg_uncond)
     grid_imgs = Image.fromarray(grid.astype(np.uint8))
     grid_imgs.save(os.path.join(output_path, f'./samples_test.png'))
     pbar.update(1)
