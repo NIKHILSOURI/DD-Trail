@@ -26,9 +26,10 @@ try:
     )
     from sarhm.prototypes import ClassPrototypes
     _SARHM_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     _SARHM_AVAILABLE = False
     compute_alpha_from_attention = None
+    _SARHM_IMPORT_ERROR = str(e)
 
 
 def create_model_from_config(config, num_voxels, global_pool):
@@ -54,6 +55,10 @@ class cond_stage_model(nn.Module):
         super().__init__()
         self.use_sarhm = use_sarhm and _SARHM_AVAILABLE
         self.ablation_mode = ablation_mode if self.use_sarhm else 'baseline'
+        if use_sarhm and not _SARHM_AVAILABLE:
+            import sys
+            err = getattr(sys.modules[__name__], '_SARHM_IMPORT_ERROR', 'unknown')
+            print("[cond_stage_model] WARNING: use_sarhm=True but 'sarhm' failed to import; using baseline. Error: %s" % err)
         self._sarhm_extra = {}  # optional diagnostics (attention, confidence, alpha, entropy)
         self._sarhm_header_printed = False
         self._baseline_header_printed = False

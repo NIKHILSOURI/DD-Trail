@@ -67,6 +67,20 @@ Set these in `Config_Generative_Model` (or via `config.py`) and pass the config 
   - All SAR-HM logic is switched in **`code/dc_ldm/ldm_for_eeg.py`** inside `cond_stage_model.forward(...)`.  
   - Downstream DDPM/samplers are unchanged; conditioning is always `[B, 77, 768]`.
 
+## Troubleshooting: "SAR-HM: OFF | baseline conditioning path"
+
+You may see **"SAR-HM: OFF | baseline conditioning path"** even when your config has `use_sarhm=True`. This happens when the **`sarhm` package fails to import** (e.g. different machine, missing dependency, or `PYTHONPATH` not including `code/`). The conditioner then falls back to baseline.
+
+- **Check:** At startup you should see either **"SAR-HM ACTIVE | mode=... | ..."** (SAR-HM on) or **"SAR-HM: OFF"** (baseline). If you requested SAR-HM but see OFF, look for the new warning:  
+  **`[cond_stage_model] WARNING: use_sarhm=True but 'sarhm' failed to import; using baseline. Error: ...`**  
+  The `Error:` part shows the import exception (e.g. `No module named 'sarhm'`).
+- **Fix:** From the repo root, run with `PYTHONPATH` including `code/`, e.g.  
+  `PYTHONPATH=code python code/eeg_ldm.py ...`  
+  (Windows: `set PYTHONPATH=code` then `python code/eeg_ldm.py ...`).  
+  Ensure `code/sarhm/` exists and all its dependencies are installed. After fixing the import, you should see **"SAR-HM ACTIVE"** and SAR-HM metrics in logs (e.g. `train/sarhm_retrieval_acc`, `train/sarhm_attention_entropy`).
+
+If your **training** run already shows those SAR-HM metrics in `train_log.csv`, then SAR-HM was on for that run; "SAR-HM: OFF" may have been from another run (e.g. Stage C on a machine where `sarhm` was not importable).
+
 ## Architecture Diagram (Graphviz)
 
 Render the diagram:

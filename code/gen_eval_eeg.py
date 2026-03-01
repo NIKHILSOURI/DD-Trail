@@ -92,6 +92,16 @@ if __name__ == '__main__':
                     '%s'%(datetime.datetime.now().strftime("%d-%m-%Y-%H-%M-%S")))
     os.makedirs(output_path, exist_ok=True)
 
+    # ----- DEBUG: Pretrained SD checkpoint existence (B) -----
+    try:
+        _sd_ckpt_path = os.path.join(getattr(config, 'pretrain_gm_path', ''), 'models', 'v1-5-pruned.ckpt')
+        _sd_exists = os.path.exists(_sd_ckpt_path)
+        print("[DEBUG] [SD_CKPT] path=%s exists=%s" % (_sd_ckpt_path, _sd_exists))
+        if not _sd_exists:
+            print("[DEBUG] [SD_CKPT] WARNING: SD 1.5 checkpoint file not found. If Stage B was trained on this machine, UNet/VAE were loaded from this path; missing file can mean random-init UNet/VAE and thus pure noise. If this checkpoint was trained elsewhere, weights are inside the .pth and this warning may be benign.")
+    except Exception as _e:
+        print("[DEBUG] [SD_CKPT] MISSING (exception): %s" % _e)
+
     # GPU only: require CUDA, no CPU fallback
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -129,10 +139,113 @@ if __name__ == '__main__':
                 ddim_steps=config.ddim_steps, global_pool=config.global_pool, use_time_cond=config.use_time_cond,
                 clip_tune=getattr(config, 'clip_tune', True), cls_tune=getattr(config, 'cls_tune', False),
                 main_config=config)
-    generative_model.model.load_state_dict(sd['model_state_dict'], strict=False)
+    # ----- DEBUG: Checkpoint load integrity (A) -----
+    try:
+        missing, unexpected = generative_model.model.load_state_dict(sd['model_state_dict'], strict=False)
+        missing_list = list(missing)
+        unexpected_list = list(unexpected)
+        print("[DEBUG] [CKPT_LOAD] total missing keys=%d total unexpected keys=%d" % (len(missing_list), len(unexpected_list)))
+        def _count_prefix(keys, prefix):
+            return sum(1 for k in keys if k.startswith(prefix))
+        print("[DEBUG] [CKPT_LOAD] missing by prefix: model.diffusion_model=%d first_stage_model=%d cond_stage_model=%d (sarhm in key)=%d" % (
+            _count_prefix(missing_list, "model.diffusion_model"),
+            _count_prefix(missing_list, "first_stage_model"),
+            _count_prefix(missing_list, "cond_stage_model"),
+            _count_prefix(missing_list, "cond_stage_model.sarhm") + _count_prefix(missing_list, "sarhm")))
+        print("[DEBUG] [CKPT_LOAD] unexpected by prefix: model.diffusion_model=%d first_stage_model=%d cond_stage_model=%d (sarhm in key)=%d" % (
+            _count_prefix(unexpected_list, "model.diffusion_model"),
+            _count_prefix(unexpected_list, "first_stage_model"),
+            _count_prefix(unexpected_list, "cond_stage_model"),
+            _count_prefix(unexpected_list, "cond_stage_model.sarhm") + _count_prefix(unexpected_list, "sarhm")))
+        print("[DEBUG] [CKPT_LOAD] first 20 missing keys: %s" % (missing_list[:20],))
+        print("[DEBUG] [CKPT_LOAD] first 20 unexpected keys: %s" % (unexpected_list[:20],))
+    except Exception as e:
+        print("[DEBUG] [CKPT_LOAD] load_state_dict failed or no return: %s" % e)
+        generative_model.model.load_state_dict(sd['model_state_dict'], strict=False)
     print('load ldm successfully')
-    state = sd['state']
+    state = sd.get('state')
     pbar.update(1)
+
+    # ----- DEBUG: scale_factor at inference (C) -----
+    try:
+        sf = getattr(generative_model.model, 'scale_factor', None)
+        if sf is not None and hasattr(sf, 'item'):
+            sf_val = float(sf.item())
+        else:
+            sf_val = float(sf) if sf is not None else None
+        print("[DEBUG] [SCALE_FACTOR] value=%s expected=0.18215 match=%s" % (sf_val, (sf_val == 0.18215) if sf_val is not None else "MISSING"))
+        if sf_val is None:
+            print("[DEBUG] [SCALE_FACTOR] MISSING: generative_model.model.scale_factor not found")
+    except Exception as e:
+        print("[DEBUG] [SCALE_FACTOR] MISSING (exception): %s" % e)
+
+    # ----- DEBUG: Conditioning sanity once per run (D) -----
+    try:
+        first_item = dataset_test[0]
+        eeg = first_item['eeg']
+        if hasattr(eeg, 'dim') and eeg.dim() == 2:
+            eeg = eeg.unsqueeze(0).to(device)
+        else:
+            eeg = torch.as_tensor(eeg, dtype=torch.float32, device=device) if not isinstance(eeg, torch.Tensor) else eeg.to(device)
+        if eeg.dim() == 2:
+            eeg = eeg.unsqueeze(0)
+        with torch.no_grad():
+            c, _ = generative_model.model.get_learned_conditioning(eeg)
+        c_final = c if isinstance(c, torch.Tensor) else (c[list(c.keys())[0]][0] if isinstance(c, dict) else None)
+        if c_final is not None:
+            cf = c_final.float()
+            print("[DEBUG] [COND] c_final mean=%.6f std=%.6f min=%.6f max=%.6f" % (cf.mean().item(), cf.std().item(), cf.min().item(), cf.max().item()))
+            nan_inf = torch.isnan(cf).any().item() or torch.isinf(cf).any().item()
+            print("[DEBUG] [COND] c_final has_NaN_or_Inf=%s" % nan_inf)
+        csm = getattr(generative_model.model, 'cond_stage_model', None)
+        if csm is not None and getattr(csm, '_sarhm_extra', None):
+            extra = csm._sarhm_extra
+            c_base = extra.get('c_base')
+            if c_base is not None:
+                cb = c_base.float()
+                print("[DEBUG] [COND] c_base mean=%.6f std=%.6f min=%.6f max=%.6f" % (cb.mean().item(), cb.std().item(), cb.min().item(), cb.max().item()))
+            alpha = extra.get('alpha')
+            if alpha is not None:
+                ah = alpha.float()
+                print("[DEBUG] [COND] alpha mean=%.6f min=%.6f max=%.6f" % (ah.mean().item(), ah.min().item(), ah.max().item()))
+        else:
+            print("[DEBUG] [COND] c_base/alpha not available (baseline or _sarhm_extra missing)")
+    except Exception as e:
+        print("[DEBUG] [COND] MISSING (exception): %s" % e)
+
+    # ----- DEBUG: VAE round-trip sanity (E) -----
+    try:
+        model = generative_model.model.to(device)
+        model.eval()
+        sample_item = dataset_test[0]
+        img = sample_item['image']
+        if isinstance(img, np.ndarray):
+            img = torch.from_numpy(img).float()
+        if img.dim() == 3 and img.shape[-1] == 3:
+            img = rearrange(img, 'h w c -> 1 c h w')
+        elif img.dim() == 3:
+            img = img.unsqueeze(0)
+        img = img.to(device)
+        if img.max() <= 1.0 and img.min() >= 0.0:
+            img = img * 2.0 - 1.0
+        with torch.no_grad():
+            enc = model.encode_first_stage(img)
+            z = model.get_first_stage_encoding(enc)
+            rec = model.decode_first_stage(z)
+        rec = torch.clamp((rec + 1.0) / 2.0, 0.0, 1.0)
+        rec_np = (255. * rearrange(rec[0], 'c h w -> h w c').cpu().numpy()).astype(np.uint8)
+        vae_path = os.path.join(output_path, 'vae_roundtrip.png')
+        Image.fromarray(rec_np).save(vae_path)
+        print("[DEBUG] [VAE_ROUNDTRIP] saved %s" % vae_path)
+        rec_mean = rec.float().mean().item()
+        rec_std = rec.float().std().item()
+        if rec_std < 1e-5 or torch.isnan(rec).any() or torch.isinf(rec).any():
+            print("[DEBUG] [VAE_ROUNDTRIP] WARNING: Reconstruction looks wrong (near-constant, NaN or Inf). VAE/scale_factor pipeline or weights may be incorrect.")
+        else:
+            print("[DEBUG] [VAE_ROUNDTRIP] recon mean=%.4f std=%.4f (sanity check)" % (rec_mean, rec_std))
+    except Exception as e:
+        print("[DEBUG] [VAE_ROUNDTRIP] MISSING (exception): %s" % e)
+        print("[DEBUG] [VAE_ROUNDTRIP] WARNING: Could not run VAE round-trip. If reconstructions are noise, VAE/scale_factor pipeline is wrong or weights not loaded.")
 
     # C) Professor-friendly attention plot when SAR-HM is on
     if getattr(config, 'use_sarhm', False):
