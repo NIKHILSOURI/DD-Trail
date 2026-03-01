@@ -168,6 +168,58 @@ Replace `<timestamp>` with your run folder name (e.g. `28-02-2026-21-42-16`).
 
 ---
 
+## Stage B: 5-epoch quality check (correct-by-default)
+
+Stage B now generates validation images every epoch when not disabled. Defaults: `disable_image_generation_in_val=False`, `val_image_gen_every_n_epoch=1`, `check_val_every_n_epoch=5`, `val_gen_limit=2`, `val_ddim_steps=50`, `val_num_samples=2`.
+
+**4) Baseline 5-epoch quality check (no SAR-HM)**
+
+```bash
+python code/eeg_ldm.py --dataset EEG --checkpoint_path pretrains/eeg_pretain/checkpoint.pth \
+  --splits_path datasets/block_splits_by_image_single.pth --eeg_signals_path datasets/eeg_5_95_std.pth \
+  --pretrain_gm_path pretrains --num_epoch 5 --check_val_every_n_epoch 1 \
+  --use_sarhm false --ablation_mode baseline
+```
+
+**5) Full SAR-HM 5-epoch quality check**
+
+```bash
+python code/eeg_ldm.py --dataset EEG --checkpoint_path pretrains/eeg_pretain/checkpoint.pth \
+  --splits_path datasets/block_splits_by_image_single.pth --eeg_signals_path datasets/eeg_5_95_std.pth \
+  --pretrain_gm_path pretrains --num_epoch 5 --check_val_every_n_epoch 1 \
+  --use_sarhm true --ablation_mode full_sarhm
+```
+
+**6) Smoke test (minimal run: 1 val item, 4 samples, 25 steps, val every epoch)**
+
+```bash
+python code/eeg_ldm.py --dataset EEG --checkpoint_path pretrains/eeg_pretain/checkpoint.pth \
+  --splits_path datasets/block_splits_by_image_single.pth --eeg_signals_path datasets/eeg_5_95_std.pth \
+  --pretrain_gm_path pretrains --num_epoch 3 --smoke_test
+```
+
+---
+
+## If outputs are still noisy: debug flags
+
+- **Stage B** – enable conditioning stats + VAE round-trip + save intermediate decoded images at steps 250,200,150,100,50 for the first val sample:
+  ```bash
+  python code/eeg_ldm.py ... --num_epoch 5 --debug
+  ```
+  Or only sampling intermediates: `--debug_sampling_steps 250,200,150,100,50`.
+
+- **Stage C** – conditioning stats, VAE round-trip, and attention plot:
+  ```bash
+  python code/gen_eval_eeg.py ... --debug
+  ```
+
+Interpretation:
+- **Conditioning stats** (`[COND_STATS]` / `[COND]`): mean/std/min/max/norm for c_base, c_sar, c_final and alpha/conf/entropy. NaN/Inf or extreme scales → conditioning or SAR-HM retrieval issue.
+- **VAE round-trip** (`vae_roundtrip.png`): encode then decode one real image. If this is noise → VAE/scale_factor or dtype issue.
+- **Sampling intermediates** (`val_intermediates/step*_sample*.png`): first val sample decoded at given steps. If structure never appears → sampling or conditioning; if it appears late → step count or schedule.
+
+---
+
 When correct, you should see:
 
 - `[DEBUG] [PROTO] loaded path=... source=loaded shape=(40, 768) ... finite=True`

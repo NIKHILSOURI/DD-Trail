@@ -271,6 +271,11 @@ if __name__ == '__main__':
             _count_prefix(unexpected_list, "cond_stage_model.sarhm") + _count_prefix(unexpected_list, "sarhm")))
         print("[DEBUG] [CKPT_LOAD] first 20 missing keys: %s" % (missing_list[:20],))
         print("[DEBUG] [CKPT_LOAD] first 20 unexpected keys: %s" % (unexpected_list[:20],))
+        # If only cond_ln is missing, checkpoint was saved without LayerNorm conditioning (expected with older config)
+        cond_ln_only = (len(missing_list) <= 2 and all(
+            k in ('cond_stage_model.cond_ln.weight', 'cond_stage_model.cond_ln.bias') for k in missing_list))
+        if cond_ln_only and missing_list:
+            print("[DEBUG] [CKPT_LOAD] cond_ln missing is OK: using random init (checkpoint from run without normalize_conditioning/layernorm).")
     except Exception as e:
         print("[DEBUG] [CKPT_LOAD] load_state_dict failed or no return: %s" % e)
         generative_model.model.load_state_dict(sd['model_state_dict'], strict=False)
@@ -365,44 +370,47 @@ if __name__ == '__main__':
 
     # ----- DEBUG: Conditioning sanity once per run (D) -----
     try:
-        first_item = dataset_test[0]
-        eeg = first_item['eeg']
-        if hasattr(eeg, 'dim') and eeg.dim() == 2:
-            eeg = eeg.unsqueeze(0).to(device)
+        if len(dataset_test) == 0:
+            print("[DEBUG] [COND] skip (test set empty)")
         else:
-            eeg = torch.as_tensor(eeg, dtype=torch.float32, device=device) if not isinstance(eeg, torch.Tensor) else eeg.to(device)
-        if eeg.dim() == 2:
-            eeg = eeg.unsqueeze(0)
-        with torch.no_grad():
-            c, _ = generative_model.model.get_learned_conditioning(eeg)
-        c_final = c if isinstance(c, torch.Tensor) else (c[list(c.keys())[0]][0] if isinstance(c, dict) else None)
-        if c_final is not None:
-            cf = c_final.float()
-            print("[DEBUG] [COND] c_final mean=%.6f std=%.6f min=%.6f max=%.6f" % (cf.mean().item(), cf.std().item(), cf.min().item(), cf.max().item()))
-            nan_inf = torch.isnan(cf).any().item() or torch.isinf(cf).any().item()
-            print("[DEBUG] [COND] c_final has_NaN_or_Inf=%s" % nan_inf)
-        csm_inner = getattr(generative_model.model, 'cond_stage_model', None)
-        if csm_inner is not None and getattr(csm_inner, '_sarhm_extra', None):
-            extra = csm_inner._sarhm_extra
-            c_base = extra.get('c_base')
-            if c_base is not None:
-                cb = c_base.float()
-                print("[DEBUG] [COND] c_base mean=%.6f std=%.6f min=%.6f max=%.6f" % (cb.mean().item(), cb.std().item(), cb.min().item(), cb.max().item()))
-            c_sar = extra.get('c_sar')
-            if c_sar is not None:
-                cs = c_sar.float()
-                print("[DEBUG] [COND] c_sar mean=%.6f std=%.6f min=%.6f max=%.6f" % (cs.mean().item(), cs.std().item(), cs.min().item(), cs.max().item()))
-            alpha = extra.get('alpha')
-            if alpha is not None:
-                ah = alpha.float()
-                print("[DEBUG] [COND] alpha min=%.6f mean=%.6f max=%.6f" % (ah.min().item(), ah.mean().item(), ah.max().item()))
-        else:
-            print("[DEBUG] [COND] c_base/c_sar/alpha not available (baseline or _sarhm_extra missing)")
+            first_item = dataset_test[0]
+            eeg = first_item['eeg']
+            if hasattr(eeg, 'dim') and eeg.dim() == 2:
+                eeg = eeg.unsqueeze(0).to(device)
+            else:
+                eeg = torch.as_tensor(eeg, dtype=torch.float32, device=device) if not isinstance(eeg, torch.Tensor) else eeg.to(device)
+            if eeg.dim() == 2:
+                eeg = eeg.unsqueeze(0)
+            with torch.no_grad():
+                c, _ = generative_model.model.get_learned_conditioning(eeg)
+            c_final = c if isinstance(c, torch.Tensor) else (c[list(c.keys())[0]][0] if isinstance(c, dict) else None)
+            if c_final is not None:
+                cf = c_final.float()
+                print("[DEBUG] [COND] c_final mean=%.6f std=%.6f min=%.6f max=%.6f" % (cf.mean().item(), cf.std().item(), cf.min().item(), cf.max().item()))
+                nan_inf = torch.isnan(cf).any().item() or torch.isinf(cf).any().item()
+                print("[DEBUG] [COND] c_final has_NaN_or_Inf=%s" % nan_inf)
+            csm_inner = getattr(generative_model.model, 'cond_stage_model', None)
+            if csm_inner is not None and getattr(csm_inner, '_sarhm_extra', None):
+                extra = csm_inner._sarhm_extra
+                c_base = extra.get('c_base')
+                if c_base is not None:
+                    cb = c_base.float()
+                    print("[DEBUG] [COND] c_base mean=%.6f std=%.6f min=%.6f max=%.6f" % (cb.mean().item(), cb.std().item(), cb.min().item(), cb.max().item()))
+                c_sar = extra.get('c_sar')
+                if c_sar is not None:
+                    cs = c_sar.float()
+                    print("[DEBUG] [COND] c_sar mean=%.6f std=%.6f min=%.6f max=%.6f" % (cs.mean().item(), cs.std().item(), cs.min().item(), cs.max().item()))
+                alpha = extra.get('alpha')
+                if alpha is not None:
+                    ah = alpha.float()
+                    print("[DEBUG] [COND] alpha min=%.6f mean=%.6f max=%.6f" % (ah.min().item(), ah.mean().item(), ah.max().item()))
+            else:
+                print("[DEBUG] [COND] c_base/c_sar/alpha not available (baseline or _sarhm_extra missing)")
     except Exception as e:
         print("[DEBUG] [COND] MISSING (exception): %s" % e)
 
     # ----- DEBUG: VAE round-trip sanity (E); only when --debug -----
-    if getattr(args, 'debug', False):
+    if getattr(args, 'debug', False) and len(dataset_test) > 0:
         try:
             model = generative_model.model.to(device)
             model.eval()
@@ -422,6 +430,7 @@ if __name__ == '__main__':
             with torch.no_grad():
                 enc = model.encode_first_stage(img)
                 z = model.get_first_stage_encoding(enc)
+                z = z.float()
                 rec = model.decode_first_stage(z)
             rec = rec.float()
             rec = torch.clamp((rec + 1.0) / 2.0, 0.0, 1.0)
@@ -442,7 +451,7 @@ if __name__ == '__main__':
             print("[DEBUG] [VAE_ROUNDTRIP] *** WARNING: Could not run VAE round-trip. If reconstructions are noise, VAE/scale_factor pipeline is wrong or weights not loaded.")
 
     # C) Professor-friendly attention plot when SAR-HM is on
-    if getattr(config, 'use_sarhm', False):
+    if getattr(config, 'use_sarhm', False) and len(dataset_test) > 0:
         try:
             fig_dir = os.path.join(output_path, 'figures')
             os.makedirs(fig_dir, exist_ok=True)

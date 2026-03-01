@@ -9,6 +9,12 @@ if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
 import warnings
 warnings.filterwarnings("ignore", message=".*pretrained.*deprecated.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*Arguments other than a weight enum.*", category=UserWarning)
+# Lightning / PyTorch deprecation and logger warnings (Stage B runs correctly)
+warnings.filterwarnings("ignore", message=".*GradScaler.*deprecated.*", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*tensorboardX.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*LeafSpec.*", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*duplicate parameters.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*dataloader.*does not have many workers.*", category=UserWarning)
 
 import numpy as np
 import torch
@@ -389,6 +395,13 @@ def main(config):
 
     pbar.update(1)
     pbar.set_description('Finetune')
+    # Use CSVLogger when no logger set to avoid Lightning's tensorboardX warning
+    if config.logger is None:
+        try:
+            from pytorch_lightning.loggers import CSVLogger
+            config.logger = CSVLogger(save_dir=config.output_path, name='')
+        except Exception:
+            pass
     # finetune the model
     extra_callbacks = []
     if metric_logger is not None and run_dir and ExperimentLoggingCallback is not None:
@@ -466,7 +479,9 @@ def get_args_parser():
     parser.add_argument('--val_image_gen_every_n_epoch', type=int, default=None, help='Generate images in val only every N epochs; 0 = never. Ignored if disable_image_generation_in_val=true.')
     parser.add_argument('--resume_ckpt', type=str, default=None, help='Resume from this checkpoint path (same as --checkpoint_path; loads model state and config from .pth)')
     parser.add_argument('--use_compile', action='store_true', help='Use torch.compile (PyTorch 2+) for faster training if available')
-
+    parser.add_argument('--smoke_test', action='store_true', help='Short quality check: val_gen_limit=1, num_samples=4, val_ddim_steps=25, check_val_every_n_epoch=1, val_image_gen_every_n_epoch=1')
+    parser.add_argument('--debug', action='store_true', help='Enable debug toggles: debug_cond_stats, debug_vae_roundtrip')
+    parser.add_argument('--debug_sampling_steps', type=str, default=None, help='Comma-separated steps to save intermediate val images (e.g. 250,200,150,100,50)')
     # # distributed training parameters
     # parser.add_argument('--local_rank', type=int)
 
@@ -480,9 +495,37 @@ def update_config(args, config):
     # Resume: --resume_ckpt overrides checkpoint_path
     if getattr(args, 'resume_ckpt', None) is not None:
         config.checkpoint_path = args.resume_ckpt
+    # --smoke_test: short quality check run
+    if getattr(args, 'smoke_test', False):
+        config.val_gen_limit = 1
+        config.num_samples = 4
+        config.val_ddim_steps = 25
+        config.check_val_every_n_epoch = 1
+        config.val_image_gen_every_n_epoch = 1
+        if getattr(config, 'disable_image_generation_in_val', True) == True:
+            config.disable_image_generation_in_val = False
+        if getattr(config, 'val_image_gen_every_n_epoch', 0) == 0:
+            config.val_image_gen_every_n_epoch = 1
+        print("[SMOKE_TEST] val_gen_limit=1 num_samples=4 val_ddim_steps=25 check_val_every_n_epoch=1 val_image_gen_every_n_epoch=1")
+    # --debug: enable conditioning stats and VAE round-trip
+    if getattr(args, 'debug', False):
+        config.debug_cond_stats = True
+        config.debug_vae_roundtrip = True
+        if getattr(config, 'debug_sampling_steps', None) is None:
+            config.debug_sampling_steps = [250, 200, 150, 100, 50]
+        print("[DEBUG] debug_cond_stats=True debug_vae_roundtrip=True")
+    if getattr(args, 'debug_sampling_steps', None):
+        try:
+            config.debug_sampling_steps = [int(x.strip()) for x in args.debug_sampling_steps.split(',') if x.strip()]
+        except Exception:
+            config.debug_sampling_steps = None
     # Normalize CLI bools
     if hasattr(args, 'disable_image_generation_in_val') and args.disable_image_generation_in_val is not None:
         config.disable_image_generation_in_val = (args.disable_image_generation_in_val == 'true')
+    # When validation image gen is enabled, default to every epoch if not set
+    if not getattr(config, 'disable_image_generation_in_val', True):
+        if getattr(config, 'val_image_gen_every_n_epoch', 0) == 0:
+            config.val_image_gen_every_n_epoch = 1
     # Normalize precision: CLI may pass "16", "32", or "bf16"
     if hasattr(config, 'precision') and isinstance(getattr(config, 'precision'), str):
         p = config.precision.strip().lower()

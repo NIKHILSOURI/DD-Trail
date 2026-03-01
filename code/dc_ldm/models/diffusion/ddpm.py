@@ -416,7 +416,8 @@ class DDPM(pl.LightningModule):
 
     
     @torch.no_grad()
-    def generate(self, data, num_samples, ddim_steps=300, HW=None, limit=None, state=None):
+    def generate(self, data, num_samples, ddim_steps=300, HW=None, limit=None, state=None,
+                 debug_sampling_steps=None, debug_save_dir=None):
         # fmri_embedding: n, seq_len, embed_dim
         all_samples = []
         if HW is None:
@@ -445,6 +446,7 @@ class DDPM(pl.LightningModule):
         n_run = min(limit, n_items) if limit is not None else n_items
         if n_run > 0:
             print(f"Validation generate: {n_run} items (~70 min/item on typical GPU). Remaining in bar below.")
+        debug_steps_set = set(int(s) for s in debug_sampling_steps) if debug_sampling_steps else None
         with model.ema_scope():
             items_iter = list(zip(data['eeg'], data['image']))
             if limit is not None:
@@ -453,20 +455,38 @@ class DDPM(pl.LightningModule):
                                     unit='item', bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
                 latent = item[0] # fmri embedding
                 gt_image = rearrange(item[1], 'h w c -> 1 c h w') # h w c
-                # c = model.get_learned_conditioning(repeat(latent, 'h w -> c h w', c=num_samples).to(self.device))
+                # Optional: save intermediate decoded images at given steps for first item (noise debugging)
+                img_cb = None
+                if count == 0 and debug_steps_set and debug_save_dir:
+                    import os
+                    os.makedirs(debug_save_dir, exist_ok=True)
+                    def _save_step(pred_x0, i, step):
+                        if int(step) in debug_steps_set:
+                            x = model.decode_first_stage(pred_x0.float())
+                            x = torch.clamp((x + 1.0) / 2.0, min=0.0, max=1.0)
+                            for b in range(x.shape[0]):
+                                arr = (255. * x[b].detach().cpu().numpy().transpose(1, 2, 0)).astype(np.uint8)
+                                Image.fromarray(arr).save(
+                                    os.path.join(debug_save_dir, 'step%d_sample%d.png' % (int(step), b)))
+                    img_cb = _save_step
                 c, re_latent = model.get_learned_conditioning(repeat(latent, 'h w -> c h w', c=num_samples).to(self.device))
                 samples_ddim, _ = sampler.sample(S=ddim_steps, 
                                                 conditioning=c,
                                                 batch_size=num_samples,
                                                 shape=shape,
                                                 verbose=False,
-                                                generator=None)
+                                                generator=None,
+                                                img_callback=img_cb)
 
                 x_samples_ddim = model.decode_first_stage(samples_ddim)
                 x_samples_ddim = torch.clamp((x_samples_ddim+1.0)/2.0,min=0.0, max=1.0)
                 gt_image = torch.clamp((gt_image+1.0)/2.0,min=0.0, max=1.0)
                 
                 all_samples.append(torch.cat([gt_image.detach().cpu(), x_samples_ddim.detach().cpu()], dim=0)) # put groundtruth at first
+        
+        # Guard: return safe values when no samples (e.g. empty batch)
+        if not all_samples:
+            return None, np.array([]), state
         
         # display as grid
         grid = torch.stack(all_samples, 0)
@@ -500,9 +520,57 @@ class DDPM(pl.LightningModule):
         if batch_idx != 0:
             return
         
-        # Stage B: never run PLMS/DDIM during training validation (saves time/VRAM). Use Stage C for generation.
-        rank_zero_only(lambda: print(f'Stage B: skipping image generation during validation (epoch {self.trainer.current_epoch if getattr(self, "trainer", None) else 0}).'))()
-        self.log('val/skip_image_generation', 1.0, on_step=False, on_epoch=True)
+        main_cfg = getattr(self, 'main_config', None)
+        disable_gen = getattr(main_cfg, 'disable_image_generation_in_val', True)
+        every_n = getattr(main_cfg, 'val_image_gen_every_n_epoch', 0)
+        current_epoch = self.trainer.current_epoch if getattr(self, 'trainer', None) else 0
+        
+        do_gen = not disable_gen and every_n > 0 and (current_epoch % every_n == 0)
+        val_limit = getattr(main_cfg, 'val_gen_limit', 2)
+        val_num_samples = getattr(main_cfg, 'val_num_samples', 2)
+        val_ddim_steps = getattr(main_cfg, 'val_ddim_steps', 50)
+        rank_zero_only(lambda: print("[VAL_GEN] generating images: %s, num_items=%s, ddim_steps=%s, num_samples=%s" % (
+            'yes' if do_gen else 'no', val_limit, val_ddim_steps, val_num_samples)))()
+        
+        if do_gen:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            try:
+                debug_steps = getattr(main_cfg, 'debug_sampling_steps', None)
+                debug_dir = None
+                if debug_steps and getattr(self, 'trainer', None) and getattr(self.trainer, 'log_dir', None):
+                    debug_dir = os.path.join(self.trainer.log_dir, 'val_intermediates')
+                grid, all_samples, _ = self.generate(
+                    batch, num_samples=val_num_samples, ddim_steps=val_ddim_steps,
+                    HW=getattr(main_cfg, 'HW', None), limit=val_limit,
+                    debug_sampling_steps=debug_steps, debug_save_dir=debug_dir)
+                if all_samples is not None and len(all_samples) > 0:
+                    # Single-image mode: save exactly one final image per epoch to val_images/epoch_XXX.png
+                    output_path = getattr(self, 'output_path', None) or (getattr(main_cfg, 'output_path', None) if main_cfg else None)
+                    if output_path and val_limit == 1 and val_num_samples == 1:
+                        val_images_dir = os.path.join(output_path, 'val_images')
+                        os.makedirs(val_images_dir, exist_ok=True)
+                        single = all_samples[0][1]
+                        if single.ndim == 3:
+                            path = os.path.join(val_images_dir, 'epoch_%03d.png' % current_epoch)
+                            Image.fromarray(rearrange(single, 'c h w -> h w c')).save(path)
+                            rank_zero_only(lambda: print("[VAL_IMG] epoch=%d saved path=%s" % (current_epoch, path)))()
+                        else:
+                            self.save_images(all_samples, suffix='epoch%d' % current_epoch)
+                            rank_zero_only(lambda: print(f'Stage B: validation (epoch {current_epoch}): saved to val/'))()
+                    else:
+                        self.save_images(all_samples, suffix='epoch%d' % current_epoch)
+                        rank_zero_only(lambda: print(f'Stage B: validation image generation (epoch {current_epoch}): saved {len(all_samples)} items x {val_num_samples+1} images to val/'))()
+                elif do_gen:
+                    rank_zero_only(lambda: print(f'Stage B: validation image generation (epoch {current_epoch}): no samples produced (empty batch or limit=0).'))()
+                self.log('val/skip_image_generation', 0.0, on_step=False, on_epoch=True)
+            except Exception as e:
+                rank_zero_only(lambda: print(f'Stage B: validation image generation failed (epoch {current_epoch}): {e}'))()
+                self.log('val/skip_image_generation', 1.0, on_step=False, on_epoch=True)
+        else:
+            rank_zero_only(lambda: print(f'Stage B: skipping image generation during validation (epoch {current_epoch}).'))()
+            self.log('val/skip_image_generation', 1.0, on_step=False, on_epoch=True)
+        
         self.validation_count += 1
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -895,6 +963,20 @@ class LatentDiffusion(DDPM):
         if self.model.conditioning_key is not None:
             if cond_key is None:
                 cond_key = self.cond_stage_key
+            # SAR-HM alpha warmup: set effective_alpha_max on cond_stage_model before conditioning
+            main_cfg = getattr(self, 'main_config', None)
+            if main_cfg and getattr(self, 'cond_stage_model', None):
+                csm = self.cond_stage_model
+                if getattr(csm, 'use_sarhm', False):
+                    warmup = getattr(main_cfg, 'warmup_epochs', 10)
+                    start = getattr(main_cfg, 'alpha_max_start', 0.05)
+                    end = getattr(main_cfg, 'alpha_max_end', 0.2)
+                    cur = getattr(self.trainer, 'current_epoch', 0) if getattr(self, 'trainer', None) else 0
+                    if warmup <= 0:
+                        csm._effective_alpha_max = end
+                    else:
+                        frac = min(1.0, cur / warmup)
+                        csm._effective_alpha_max = start + frac * (end - start)
             if cond_key != self.first_stage_key:
                 if cond_key in ['caption', 'coordinates_bbox','fmri', 'eeg']:
                     xc = batch[cond_key]
@@ -1571,13 +1653,13 @@ class LatentDiffusion(DDPM):
         lr = self.learning_rate
         if self.train_cond_stage_only:
             print(f"{self.__class__.__name__}: Only optimizing conditioner params!")
-            cond_parms = [p for n, p in self.named_parameters() 
-                    if 'attn2' in n or 'time_embed_condtion' in n or 'norm2' in n]
-            # cond_parms = [p for n, p in self.named_parameters() 
-                    # if 'time_embed_condtion' in n]
-            # cond_parms = []
-            
+            # Cond_parms from diffusion model only (attn2, time_embed, norm2) to avoid duplicate params with cond_stage_model
+            cond_parms = [p for n, p in self.model.named_parameters()
+                         if 'attn2' in n or 'time_embed_condtion' in n or 'norm2' in n]
             params = list(self.cond_stage_model.parameters()) + cond_parms
+            # Deduplicate by id() in case of any overlap
+            seen = set()
+            params = [p for p in params if id(p) not in seen and not seen.add(id(p))]
         
             for p in params:
                 p.requires_grad = True

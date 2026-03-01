@@ -101,7 +101,11 @@ class ClassPrototypes(nn.Module):
                 meta["git_hash"] = r.stdout.strip()[:12]
         except Exception:
             meta["git_hash"] = None
-        torch.save({"prototypes": self.prototypes.detach().cpu(), "metadata": meta}, path)
+        P = self.prototypes.detach().cpu().float()
+        if P.shape[1] != 768:
+            pass  # allow other dims; shape is [K, dim]
+        P = torch.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)
+        torch.save({"prototypes": P, "metadata": meta}, path)
         return path
 
     def update_from_batch(

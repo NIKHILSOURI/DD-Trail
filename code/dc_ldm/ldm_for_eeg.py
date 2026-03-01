@@ -213,13 +213,14 @@ class cond_stage_model(nn.Module):
                 self._sarhm_extra = {'c_base': c_base, 'alpha': None, 'c_sar': None}
                 return c_base, latent_return
 
-            # Hard fallback: invalid prototypes -> alpha=0 (non-degrading by design)
+            # Hard fallback: invalid prototypes OR proto_source dummy/None -> alpha=0 (non-degrading by design)
             valid_proto = self.has_valid_prototypes()
-            if not valid_proto:
+            proto_src = self.get_proto_source()
+            if proto_src in ("dummy", None) or not valid_proto:
+                valid_proto = False
                 if not getattr(self, '_proto_invalid_warned', False):
                     self._proto_invalid_warned = True
-                    src = self.get_proto_source()
-                    print("[SAR-HM] WARNING: prototypes invalid or missing (proto_source=%s). Forcing alpha=0 (baseline only)." % src)
+                    print("[SAR-HM] WARNING: prototypes invalid or missing (proto_source=%s). Forcing alpha=0 (baseline only)." % proto_src)
                 # We still compute c_sar path but will force alpha=0 below
 
             # === SAR-HM path: c_sar then residual fusion c_final = c_base + alpha * (c_sar - c_base) ===
@@ -249,9 +250,10 @@ class cond_stage_model(nn.Module):
             c_sar = self.sarhm_adapter(z_fused)  # [B, 77, cond_dim]
 
             # Alpha from confidence (entropy/max/constant); alpha = alpha_max * conf, conf < conf_threshold -> 0
+            effective_alpha_max = getattr(self, '_effective_alpha_max', self.alpha_max)
             if compute_alpha_from_attention is not None and attn is not None:
                 alpha, conf_out, entropy = compute_alpha_from_attention(
-                    attn, alpha_mode=self.alpha_mode, alpha_max=self.alpha_max,
+                    attn, alpha_mode=self.alpha_mode, alpha_max=float(effective_alpha_max),
                     conf_threshold=self.conf_threshold, alpha_constant=self.alpha_constant)
             elif attn is None:
                 alpha = torch.full((c_sar.shape[0],), self.alpha_constant, device=c_sar.device, dtype=c_sar.dtype)
@@ -268,6 +270,7 @@ class cond_stage_model(nn.Module):
             # Hard fallback: invalid prototypes -> force alpha=0
             if not valid_proto:
                 alpha = torch.zeros(alpha.shape[0], device=alpha.device, dtype=alpha.dtype)
+            # Also force alpha=0 when proto_source is dummy/None (already set valid_proto=False above)
             # Ablation overrides (Stage C debug flags)
             if getattr(self, "_baseline_only", False):
                 alpha = torch.zeros(alpha.shape[0], device=alpha.device, dtype=alpha.dtype)
@@ -403,6 +406,15 @@ class eLDM:
             metafile, num_voxels, self.cond_dim, global_pool=global_pool, clip_tune=clip_tune, cls_tune=cls_tune,
             **sarhm_kw
         )
+        # Load cond_stage_model state from checkpoint (cond_ln, mae, etc.) so missing cond_ln keys are restored when present
+        csm_prefix = 'cond_stage_model.'
+        csm_sd = {k[len(csm_prefix):]: v for k, v in pl_sd.items() if k.startswith(csm_prefix)}
+        if csm_sd:
+            m_csm, u_csm = model.cond_stage_model.load_state_dict(csm_sd, strict=False)
+            if m_csm or u_csm:
+                print(f"Cond stage model load from ckpt: {len(m_csm)} missing, {len(u_csm)} unexpected")
+            if sarhm_kw.get('use_sarhm') and m_csm and any(k.startswith('cond_ln') for k in m_csm):
+                print("[SAR-HM] WARNING: checkpoint missing cond_ln weights; LayerNorm is randomly initialized. Fine-tune or load a SAR-HM ckpt for correct normalization.")
         # If checkpoint had raw MAE keys, load them into the conditioner's MAE
         if raw_mae_sd:
             m_mae, u_mae = model.cond_stage_model.mae.load_state_dict(raw_mae_sd, strict=False)
@@ -515,6 +527,15 @@ class eLDM:
                     normalization_type=getattr(csm, 'normalization_type', 'layernorm'),
                 )
                 print(f"SAR-HM prototypes saved to {proto_path}")
+                # One-time prototype stats (mean/std/min/max, finite only)
+                with torch.no_grad():
+                    P = csm.sarhm_prototypes.P.detach().cpu().float()
+                    P_fin = P[torch.isfinite(P)]
+                    if P_fin.numel() > 0:
+                        print("[PROTO_STATS] shape=%s mean=%.4f std=%.4f min=%.4f max=%.4f (finite)" % (
+                            tuple(P.shape), P_fin.mean().item(), P_fin.std().item(), P_fin.min().item(), P_fin.max().item()))
+                    else:
+                        print("[PROTO_STATS] shape=%s (no finite values)" % (tuple(P.shape),))
 
     @torch.no_grad()
     def generate(self, fmri_embedding, num_samples, ddim_steps, HW=None, limit=None, state=None, output_path = None):
@@ -580,7 +601,17 @@ class eLDM:
                         Image.fromarray(img_t).save(os.path.join(output_path, 
                             f'./test{count}-{copy_idx}.png'))
         
-        # display as grid
+        # display as grid (handle empty dataset: no test samples)
+        if not all_samples:
+            ph_c = shape[0]
+            ph_h, ph_w = 64, 64
+            placeholder = torch.ones(1, 1, ph_c, ph_h, ph_w, device=self.device) * 0.5
+            grid = rearrange(placeholder, 'n b c h w -> (n b) c h w', n=1, b=1)
+            grid = make_grid(grid, nrow=1)
+            grid_np = (255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()).astype(np.uint8)
+            model = model.to(self.device)
+            return grid_np, np.zeros((0,), dtype=np.uint8)
+
         grid = torch.stack(all_samples, 0)
         grid = rearrange(grid, 'n b c h w -> (n b) c h w')
         grid = make_grid(grid, nrow=num_samples+1)
@@ -732,6 +763,15 @@ class eLDM_eval:
                     normalization_type=getattr(csm, 'normalization_type', 'layernorm'),
                 )
                 print(f"SAR-HM prototypes saved to {proto_path}")
+                # One-time prototype stats (mean/std/min/max, finite only)
+                with torch.no_grad():
+                    P = csm.sarhm_prototypes.P.detach().cpu().float()
+                    P_fin = P[torch.isfinite(P)]
+                    if P_fin.numel() > 0:
+                        print("[PROTO_STATS] shape=%s mean=%.4f std=%.4f min=%.4f max=%.4f (finite)" % (
+                            tuple(P.shape), P_fin.mean().item(), P_fin.std().item(), P_fin.min().item(), P_fin.max().item()))
+                    else:
+                        print("[PROTO_STATS] shape=%s (no finite values)" % (tuple(P.shape),))
 
     @torch.no_grad()
     def generate(self, fmri_embedding, num_samples, ddim_steps, HW=None, limit=None, state=None, output_path=None,
@@ -806,7 +846,17 @@ class eLDM_eval:
                         Image.fromarray(img_t).save(os.path.join(output_path, 
                             f'./test{count}-{copy_idx}.png'))
         
-        # display as grid
+        # display as grid (handle empty dataset: no test samples)
+        if not all_samples:
+            ph_c = shape[0]
+            ph_h, ph_w = 64, 64
+            placeholder = torch.ones(1, 1, ph_c, ph_h, ph_w, device=self.device) * 0.5
+            grid = rearrange(placeholder, 'n b c h w -> (n b) c h w', n=1, b=1)
+            grid = make_grid(grid, nrow=1)
+            grid_np = (255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()).astype(np.uint8)
+            model = model.to(self.device)
+            return grid_np, np.zeros((0,), dtype=np.uint8)
+
         grid = torch.stack(all_samples, 0)
         grid = rearrange(grid, 'n b c h w -> (n b) c h w')
         grid = make_grid(grid, nrow=num_samples+1)
