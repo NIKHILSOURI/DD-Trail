@@ -167,6 +167,14 @@ class cond_stage_model(nn.Module):
         c_base = self._align_to_seq_len(c_base, target_seq)
 
         if self.use_sarhm:
+            # Ablation: force baseline-only path (no SAR-HM fusion)
+            if getattr(self, "_no_sarhm", False):
+                if not getattr(self, "_no_sarhm_header_printed", False):
+                    self._no_sarhm_header_printed = True
+                    print("SAR-HM: OFF | _no_sarhm=True (CLI override)")
+                self._sarhm_extra = {'c_base': c_base, 'alpha': None, 'c_sar': None}
+                return c_base, latent_return
+
             # === SAR-HM path: c_sar then residual fusion c_final = c_base + alpha * (c_sar - c_base) ===
             if not self._sarhm_header_printed:
                 self._sarhm_header_printed = True
@@ -206,6 +214,12 @@ class cond_stage_model(nn.Module):
                 alpha = torch.full((c_sar.shape[0],), self.alpha_constant, device=c_sar.device, dtype=c_sar.dtype)
                 conf_out = confidence
                 entropy = torch.zeros(c_sar.shape[0], device=c_sar.device, dtype=c_sar.dtype)
+
+            # Ablation overrides (Stage C debug flags)
+            if getattr(self, "_baseline_only", False):
+                alpha = torch.zeros(alpha.shape[0], device=alpha.device, dtype=alpha.dtype)
+            if getattr(self, "_force_alpha", None) is not None:
+                alpha = torch.full((alpha.shape[0],), float(self._force_alpha), device=alpha.device, dtype=alpha.dtype)
 
             # alpha per sample: [B] -> [B, 1, 1] for broadcasting
             alpha_bc = alpha.view(-1, 1, 1).to(c_base.dtype)

@@ -49,7 +49,9 @@ class ClassPrototypes(nn.Module):
         if path is None or not os.path.isfile(path):
             return False
         state = torch.load(path, map_location="cpu", weights_only=False)
-        if "prototypes" in state:
+        if isinstance(state, torch.Tensor):
+            P = state
+        elif "prototypes" in state:
             P = state["prototypes"]
         elif "state_dict" in state and "prototypes" in state["state_dict"]:
             P = state["state_dict"]["prototypes"]
