@@ -103,6 +103,7 @@ class Config_Generative_Model:
 
         self.eeg_signals_path = str(_DATA_ROOT / 'eeg_5_95_std.pth')
         self.splits_path = str(_DATA_ROOT / 'block_splits_by_image_single.pth')
+        self.imagenet_path = None  # Must set via --imagenet_path or IMAGENET_PATH for EEG
         # self.splits_path = str(_DATA_ROOT / 'block_splits_by_image_all.pth')
         self.roi = 'VC'
         self.patch_size = 4 # 16
@@ -167,6 +168,11 @@ class Config_Generative_Model:
         self.prune_unexpected_keys = False
         # torch.compile (PyTorch 2+) for faster training; enable with --use_compile
         self.use_compile = False
+
+        # Mini experiment: limit dataset size for fast sanity runs (0 = no limit)
+        self.limit_train_items = 0
+        self.limit_val_items = 0
+        self.skip_post_train_generation = True  # skip end-of-training image gen unless explicitly false
 
         # Thesis logging / evaluation (optional; set via CLI --run_name, --model, --seed, --eval_every, --num_eval_samples)
         self.run_name = None

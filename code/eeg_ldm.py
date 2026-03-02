@@ -26,6 +26,7 @@ from einops import rearrange
 from PIL import Image
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
+from torch.utils.data import Subset
 import copy
 from tqdm import tqdm
 
@@ -291,7 +292,21 @@ def ensure_prototypes_loaded_or_built(model, config, train_dataset, output_dir, 
     K = getattr(config, 'num_classes', 40)
     dim = 768
     proto_path = getattr(config, 'proto_path', None)
-    if proto_path and os.path.isfile(proto_path):
+    # Fast path: when init_from_ckpt is set, try loading prototypes from same run dir (avoids slow build)
+    init_ckpt = getattr(config, 'init_from_ckpt', None)
+    if init_ckpt and os.path.isfile(init_ckpt):
+        init_dir = os.path.dirname(os.path.abspath(init_ckpt))
+        candidate = os.path.join(init_dir, 'prototypes.pt')
+        if os.path.isfile(candidate) and csm.sarhm_prototypes.load_from_path(candidate):
+            csm._proto_source = "baseline_centroids"
+            config.proto_path = candidate
+            path_used = candidate
+            print('[PROTO] loaded from init run dir: %s' % candidate)
+        else:
+            path_used = None
+    else:
+        path_used = None
+    if path_used is None and proto_path and os.path.isfile(proto_path):
         if csm.sarhm_prototypes.load_from_path(proto_path):
             csm._proto_source = "baseline_centroids"
             config.proto_path = proto_path
@@ -303,6 +318,8 @@ def ensure_prototypes_loaded_or_built(model, config, train_dataset, output_dir, 
         os.makedirs(output_dir, exist_ok=True)
         batch_size_proto = max(1, min(32, len(train_dataset)))
         loader = DataLoader(train_dataset, batch_size=batch_size_proto, shuffle=False, num_workers=0)
+        print('[PROTO] Building baseline centroids (one pass over train data)...', flush=True)
+        loader = tqdm(loader, desc='[PROTO] centroids', leave=False)
         build_baseline_centroids(loader, csm, K, dim, device, save_path=save_path)
         csm.sarhm_prototypes.load_from_path(save_path)
         csm._proto_source = "baseline_centroids"
@@ -320,6 +337,7 @@ def ensure_prototypes_loaded_or_built(model, config, train_dataset, output_dir, 
     if not torch.isfinite(P).all():
         raise RuntimeError("[SAR-HM] prototypes contain non-finite values. Aborting training.")
     P.data = P.data.float()
+    print('[PROTO] loaded/built path=%s shape=(%d,%d) finite=True' % (path_used, P.shape[0], P.shape[1]))
     return path_used
 
 
@@ -357,8 +375,16 @@ def main(config):
         channel_last
     ])
     if config.dataset == 'EEG':
-
+        imagenet_path = getattr(config, 'imagenet_path', None)
+        if not imagenet_path or not str(imagenet_path).strip():
+            raise RuntimeError(
+                "EEG dataset requires imagenet_path for real GT images. "
+                "Pass --imagenet_path /path/to/ILSVRC2012 (or e.g. datasets/imageNet_images) or set IMAGENET_PATH."
+            )
+        if not os.path.isdir(imagenet_path):
+            raise RuntimeError("imagenet_path is not a directory: %s" % os.path.abspath(imagenet_path))
         eeg_latents_dataset_train, eeg_latents_dataset_test = create_EEG_dataset(eeg_signals_path = config.eeg_signals_path, splits_path = config.splits_path,
+                imagenet_path=imagenet_path,
                 image_transform=[img_transform_train, img_transform_test], subject = getattr(config, 'subject', 4))
         # eeg_latents_dataset_train, eeg_latents_dataset_test = create_EEG_dataset_viz( image_transform=[img_transform_train, img_transform_test])
         if len(eeg_latents_dataset_train) == 0:
@@ -366,6 +392,26 @@ def main(config):
         if len(eeg_latents_dataset_test) == 0:
             raise RuntimeError("Test split is empty after filtering. Check splits_path and eeg_signals_path.")
         num_voxels = eeg_latents_dataset_train.data_len
+
+        # Mini experiment: deterministic subset when limits > 0
+        limit_train = getattr(config, 'limit_train_items', 0) or 0
+        limit_val = getattr(config, 'limit_val_items', 0) or 0
+        if limit_train > 0 or limit_val > 0:
+            if limit_train > 0:
+                n_train = min(limit_train, len(eeg_latents_dataset_train))
+                if n_train == 0:
+                    raise ValueError("[MINI] limit_train_items=%d but train split is empty." % limit_train)
+                eeg_latents_dataset_train = Subset(eeg_latents_dataset_train, list(range(n_train)))
+            else:
+                n_train = len(eeg_latents_dataset_train)
+            if limit_val > 0:
+                n_val = min(limit_val, len(eeg_latents_dataset_test))
+                if n_val == 0:
+                    raise ValueError("[MINI] limit_val_items=%d but val/test split is empty." % limit_val)
+                eeg_latents_dataset_test = Subset(eeg_latents_dataset_test, list(range(n_val)))
+            else:
+                n_val = len(eeg_latents_dataset_test)
+            print('[MINI] train_items=%d val_items=%d' % (len(eeg_latents_dataset_train), len(eeg_latents_dataset_test)))
 
     else:
         raise NotImplementedError
@@ -385,14 +431,26 @@ def main(config):
 
     # create generative model
     if getattr(config, 'use_sarhm', False):
+        print('SAR-HM ACTIVE | mode=%s' % getattr(config, 'ablation_mode', 'full_sarhm'))
         print(f"SAR-HM enabled: ablation_mode={getattr(config, 'ablation_mode', 'full_sarhm')}, num_classes={getattr(config, 'num_classes', 40)}")
         from pathlib import Path
         proto_dir = Path(config.pretrain_gm_path) / 'prototypes'
         proto_dir.mkdir(parents=True, exist_ok=True)
-    generative_model = eLDM(pretrain_mbm_metafile, num_voxels,
+    try:
+        generative_model = eLDM(pretrain_mbm_metafile, num_voxels,
                 device=device, pretrain_root=config.pretrain_gm_path, logger=config.logger,
                 ddim_steps=config.ddim_steps, global_pool=config.global_pool, use_time_cond=config.use_time_cond,
                 clip_tune=config.clip_tune, cls_tune=config.cls_tune, main_config=config)
+    except ImportError as e:
+        if getattr(config, 'use_sarhm', False):
+            print('[WARN] SAR-HM import failed (%s). Falling back to baseline (use_sarhm=False).' % e)
+            config.use_sarhm = False
+            generative_model = eLDM(pretrain_mbm_metafile, num_voxels,
+                        device=device, pretrain_root=config.pretrain_gm_path, logger=config.logger,
+                        ddim_steps=config.ddim_steps, global_pool=config.global_pool, use_time_cond=config.use_time_cond,
+                        clip_tune=config.clip_tune, cls_tune=config.cls_tune, main_config=config)
+        else:
+            raise
 
     # Resume Stage-B LDM from config.resume_ckpt_path only (MAE loaded above from pretrain_mbm_path).
     # Only resume_ckpt_path triggers full resume (config + weights). init_from_ckpt is weights-only below.
@@ -452,7 +510,6 @@ def main(config):
             print('[INIT_CKPT] loaded weights from %s (strict=False) missing=%d unexpected=%d' % (
                 init_path, len(missing), len(unexpected)))
         config.start_epoch = 0
-        print('[INIT_CKPT] starting fresh from epoch 0 (no optimizer/scheduler/step loaded).')
 
     # Prototypes: build or load after dataset exists, before trainer.fit (correct time)
     if getattr(config, 'use_sarhm', False):
@@ -512,7 +569,9 @@ def main(config):
     pbar.update(1)
     pbar.set_description('Generate & evaluate')
     # Skip post-training image generation when disabled (same flag as val; Stage C does full-quality gen)
-    if getattr(config, 'disable_image_generation_in_val', False):
+    if getattr(config, 'skip_post_train_generation', True):
+        print('Stage B: skipping post-training image generation (skip_post_train_generation=True). Run Stage C for full-quality generation.\n')
+    elif getattr(config, 'disable_image_generation_in_val', False):
         print('Stage B: skipping post-training image generation (disable_image_generation_in_val=True). Run Stage C for full-quality generation.\n')
     else:
         generate_images(generative_model, eeg_latents_dataset_train, eeg_latents_dataset_test, config)
@@ -581,6 +640,10 @@ def get_args_parser():
     parser.add_argument('--debug', action='store_true', help='Enable debug toggles: debug_cond_stats, debug_vae_roundtrip')
     parser.add_argument('--debug_sampling_steps', type=str, default=None, help='Comma-separated steps to save intermediate val images (e.g. 250,200,150,100,50)')
     parser.add_argument('--prune_unexpected_keys', action='store_true', help='When loading ckpt, drop keys not in model (default False)')
+    parser.add_argument('--limit_train_items', type=int, default=0, help='Mini mode: use only first N train samples (0=no limit). Deterministic Subset(range(N)).')
+    parser.add_argument('--limit_val_items', type=int, default=0, help='Mini mode: use only first N val/test samples (0=no limit). Deterministic Subset(range(N)).')
+    parser.add_argument('--skip_post_train_generation', type=str, default='true', choices=['true', 'false'], help='If true, skip post-training image generation (Stage C for full gen). Default true for mini runs.')
+    parser.add_argument('--imagenet_path', type=str, default=None, help='ImageNet root for EEG GT images (required for dataset=EEG). Set or use env IMAGENET_PATH.')
     # # distributed training parameters
     # parser.add_argument('--local_rank', type=int)
 
@@ -629,6 +692,8 @@ def update_config(args, config):
         config.warm_start_from_baseline = False  # default false for SAR-HM fresh runs
     if getattr(args, 'init_from_ckpt', None) is not None:
         config.init_from_ckpt = args.init_from_ckpt
+    if hasattr(args, 'skip_post_train_generation') and getattr(args, 'skip_post_train_generation', None) is not None:
+        config.skip_post_train_generation = (args.skip_post_train_generation == 'true')
     # When validation image gen is enabled, default to every epoch if not set
     if not getattr(config, 'disable_image_generation_in_val', True):
         if getattr(config, 'val_image_gen_every_n_epoch', 0) == 0:
@@ -673,6 +738,8 @@ def create_trainer(num_epoch, precision=32, accumulate_grad_batches=2, logger=No
 if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()
+    if getattr(args, 'imagenet_path', None) is None and os.environ.get('IMAGENET_PATH'):
+        args.imagenet_path = os.environ.get('IMAGENET_PATH')
     if args.use_sarhm is not None:
         args.use_sarhm = args.use_sarhm == 'true'
     if args.clip_tune is not None:

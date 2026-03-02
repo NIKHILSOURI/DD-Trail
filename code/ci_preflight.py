@@ -116,6 +116,11 @@ def main():
         config = Config_Generative_Model()
         config.eeg_signals_path = str(_DATA_ROOT / "eeg_5_95_std.pth")
         config.splits_path = splits_path
+        config.imagenet_path = os.environ.get("IMAGENET_PATH") or str(_DATA_ROOT / "imageNet_images")
+        if not os.path.isdir(config.imagenet_path):
+            print("PRE-FLIGHT FAIL: imagenet_path missing or not a directory: %s" % config.imagenet_path)
+            print("  Set IMAGENET_PATH or place ImageNet at datasets/imageNet_images.")
+            sys.exit(1)
         config.pretrain_gm_path = str(_PRETRAIN_ROOT)
         config.pretrain_mbm_path = str(_PRETRAIN_ROOT / "eeg_pretain" / "checkpoint.pth")
         config.num_samples = 1
@@ -142,6 +147,7 @@ def main():
         train_ds, test_ds = create_EEG_dataset(
             eeg_signals_path=config.eeg_signals_path,
             splits_path=config.splits_path,
+            imagenet_path=config.imagenet_path,
             image_transform=[img_t, img_t],
             subject=4,
         )

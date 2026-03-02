@@ -261,14 +261,20 @@ def make_dataset(dir):
     return images
 
 from PIL import Image
+from PIL import UnidentifiedImageError
 import numpy as np
  
 
 
 class EEGDataset(Dataset):
-    
+
     # Constructor
     def __init__(self, eeg_signals_path, imagenet_path, image_transform=identity, subject = 4):
+        if not imagenet_path or not str(imagenet_path).strip():
+            raise RuntimeError(
+                "EEGDataset requires imagenet_path for real GT images. "
+                "No fallback to random noise. Set --imagenet_path to the ImageNet root (e.g. /path/to/ILSVRC2012)."
+            )
         # Load EEG signals
         loaded = torch.load(eeg_signals_path, map_location='cpu', weights_only=False)
         # if opt.subject!=0:
@@ -285,6 +291,8 @@ class EEGDataset(Dataset):
         self.image_transform = image_transform
         self.num_voxels = 440
         self.data_len = 512
+        # Indices whose image file exists and is readable (skip corrupt/empty files)
+        self.valid_indices = self._build_valid_indices()
         # Compute size
         self.size = len(self.data)
         try:
@@ -304,6 +312,32 @@ class EEGDataset(Dataset):
                     ) from e2
             else:
                 raise
+
+    def _image_readable(self, idx):
+        """Return True if the image file for data index idx exists and can be opened."""
+        image_name = self.images[self.data[idx]["image"]]
+        image_path = os.path.join(self.imagenet, image_name.split("_")[0], image_name + ".JPEG")
+        image_path = os.path.normpath(os.path.abspath(image_path))
+        if not os.path.isfile(image_path):
+            return False
+        try:
+            with Image.open(image_path) as im:
+                im.load()
+        except (UnidentifiedImageError, OSError):
+            return False
+        return True
+
+    def _build_valid_indices(self):
+        """Build set of indices whose image file is present and readable."""
+        n = len(self.data)
+        valid = []
+        for i in range(n):
+            if self._image_readable(i):
+                valid.append(i)
+        n_bad = n - len(valid)
+        if n_bad > 0:
+            print("[dataset] Skipping %d indices with missing/corrupt images (valid=%d)." % (n_bad, len(valid)))
+        return set(valid)
 
     # Get size
     def __len__(self):
@@ -325,21 +359,40 @@ class EEGDataset(Dataset):
 
         label = torch.tensor(self.data[i]["label"]).long()
 
-        # Get label
+        # Get image: require real file, no random noise fallback
         image_name = self.images[self.data[i]["image"]]
-        if self.imagenet:
-            image_path = os.path.join(self.imagenet, image_name.split('_')[0], image_name+'.JPEG')
-            image_raw = Image.open(image_path).convert('RGB') 
-        # print(image_path)
-        else:
-            noise = np.random.randint(0, 256, (512, 512, 3), dtype=np.uint8)
-            image_raw = Image.fromarray(noise, 'RGB')
-        
-        
-        image = np.array(image_raw) / 255.0
+        image_path = os.path.join(self.imagenet, image_name.split('_')[0], image_name + '.JPEG')
+        image_path = os.path.normpath(os.path.abspath(image_path))
+        if i not in self.valid_indices:
+            raise RuntimeError(
+                "Index %d excluded: image missing or corrupt at %s (valid_indices built at init)."
+                % (i, image_path)
+            )
+        if not os.path.isfile(image_path):
+            raise RuntimeError("Image file missing: %s (imagenet_path=%s, image_name=%s)" % (
+                image_path, self.imagenet, image_name))
+        img_debug = os.environ.get('IMG_DEBUG') == '1'
+        if img_debug:
+            try:
+                fsize = os.path.getsize(image_path)
+            except OSError:
+                fsize = -1
+            print("[IMG_DEBUG] idx=%d label=%s image_id=%s path=%s exists=True size=%s" % (
+                i, label.item(), image_name, image_path, fsize))
+        try:
+            image_raw = Image.open(image_path).convert('RGB')
+        except (UnidentifiedImageError, OSError) as e:
+            raise RuntimeError(
+                "Image file is corrupt or unreadable: %s (remove or replace the file and re-run). Original: %s"
+                % (image_path, e)
+            ) from e
+        # Float32 [0, 1] before transform (transform may resize and normalize to [-1,1])
+        image = np.array(image_raw, dtype=np.float32) / 255.0
+        if img_debug:
+            print("[IMG_DEBUG] after load shape=%s min=%.4f max=%.4f mean=%.4f std=%.4f" % (
+                image.shape, float(image.min()), float(image.max()), float(image.mean()), float(image.std())))
         image_raw = self.processor(images=image_raw, return_tensors="pt")
         image_raw['pixel_values'] = image_raw['pixel_values'].squeeze(0)
-
 
         return {'eeg': eeg, 'label': label, 'image': self.image_transform(image), 'image_raw': image_raw}
         # Return
@@ -376,6 +429,8 @@ class Splitter:
             except (KeyError, IndexError, TypeError):
                 continue
         self.split_idx = filtered
+        if hasattr(self.dataset, 'valid_indices'):
+            self.split_idx = [idx for idx in self.split_idx if idx in self.dataset.valid_indices]
         # Compute size
 
         self.size = len(self.split_idx)

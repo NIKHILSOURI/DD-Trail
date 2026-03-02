@@ -44,6 +44,20 @@ def _log(tag: str, msg: str) -> None:
     print("[COMPARE] [%s] %s" % (tag, msg))
 
 
+# Stubs for unpickling checkpoints saved from eeg_ldm/gen_eval_eeg (they reference __main__.normalize, channel_last)
+def normalize(img):
+    if img.shape[-1] == 3:
+        img = rearrange(img, "h w c -> c h w")
+    img = torch.tensor(img)
+    return img * 2.0 - 1.0
+
+
+def channel_last(img):
+    if img.shape[-1] == 3:
+        return img
+    return rearrange(img, "c h w -> h w c")
+
+
 def get_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Dual evaluation: BASELINE vs SAR-HM")
     p.add_argument("--dataset", type=str, default="EEG")
@@ -61,7 +75,7 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--fail_if_proto_missing", action="store_true", help="If set, error when SAR-HM needs proto but --sarhm_proto not given")
     p.add_argument("--use_train_split", action="store_true", help="Use train split instead of test")
     p.add_argument("--pretrain_root", type=str, default="pretrains")
-    p.add_argument("--imagenet_path", type=str, default=None, help="Optional: path to ImageNet for real GT images (else GT set to NA)")
+    p.add_argument("--imagenet_path", type=str, default=None, help="ImageNet root for EEG GT images (required when dataset=EEG). Set or use env IMAGENET_PATH.")
     return p
 
 
@@ -71,6 +85,12 @@ def _identity(x):
 
 def main() -> None:
     args = get_parser().parse_args()
+    if getattr(args, 'imagenet_path', None) is None and os.environ.get('IMAGENET_PATH'):
+        args.imagenet_path = os.environ.get('IMAGENET_PATH')
+    if args.dataset == 'EEG' and (not getattr(args, 'imagenet_path', None) or not str(getattr(args, 'imagenet_path', '')).strip()):
+        print("ERROR: dataset=EEG requires imagenet_path for real GT images.")
+        print("  Pass --imagenet_path /path/to/ILSVRC2012 or set IMAGENET_PATH.")
+        sys.exit(1)
     set_seed(args.seed)
 
     out_dir = args.out_dir

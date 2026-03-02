@@ -64,7 +64,7 @@ These are in `code/config.py` and can be overridden by CLI (e.g. `--num_epoch 50
 
 | Parameter | Default | Meaning |
 |-----------|---------|--------|
-| `num_epoch` | **500** | Number of training epochs for Stage B. Thesis-level: 500; quick test: 10. |
+| `num_epoch` | **500** | Number of training epochs for Stage B. Safe upper bound for best convergence; comparable quality often reached in 200–350 epochs. Quick test: 10. Use Stage C eval at 250 steps (same seed, fixed test subset) to decide; see docs/EPOCH_RECOMMENDATION.md. |
 | `batch_size` | 25 | Batch size for training (and for val dataloader). Reduce (e.g. 4) on small GPU; increase (e.g. 100) on A100 80GB if it fits. |
 | `lr` | 5.3e-5 | Learning rate. |
 | `precision` | 16 | Training precision: 16 (FP16 mixed), 32 (full), or `"bf16"` (BF16 mixed on A100). |

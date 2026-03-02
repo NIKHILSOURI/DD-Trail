@@ -36,6 +36,7 @@ from tqdm import tqdm
 from config import Config_Generative_Model
 from dataset import create_EEG_dataset
 from dc_ldm.ldm_for_eeg import eLDM_eval
+from dc_ldm.models.diffusion.plms import PLMSSampler
 from utils.state_dict_utils import filter_state_dict_for_model, log_filter_info
 
 
@@ -109,7 +110,7 @@ def get_args_parser():
                         help='sd config path.')
     
     parser.add_argument('--imagenet_path', type=str, default=None,
-                        help='imagenet path.')
+                        help='ImageNet root for EEG GT images (required for dataset EEG). Set or use env IMAGENET_PATH.')
 
     # Stage C debug / mini run
     parser.add_argument('--proto_path', type=str, default=None,
@@ -118,8 +119,8 @@ def get_args_parser():
                         help='Limit number of EEG samples to generate (train and test if not overridden).')
     parser.add_argument('--max_train_items', type=int, default=None,
                         help='Limit train set generation (overrides max_items for train).')
-    parser.add_argument('--max_test_items', type=int, default=None,
-                        help='Limit test set generation (overrides max_items for test).')
+    parser.add_argument('--max_test_items', type=int, default=0,
+                        help='Mini eval: use only first K test samples (0=no limit). Deterministic Subset(range(K)).')
     parser.add_argument('--no_sarhm', action='store_true',
                         help='Force SAR-HM off in conditioning (baseline only).')
     parser.add_argument('--force_alpha', type=float, default=-1.0,
@@ -130,6 +131,8 @@ def get_args_parser():
                         help='Extra prints and VAE roundtrip saved to figures/vae_roundtrip.png.')
     parser.add_argument('--num_samples', type=int, default=20,
                         help='Number of samples per EEG (default 20 for minimal run).')
+    parser.add_argument('--ddim_steps', type=int, default=None,
+                        help='Override DDIM/PLMS steps for generation (default: use checkpoint config).')
     parser.add_argument('--split', type=str, default='test', choices=['test', 'train'],
                         help='Which split to generate (default test).')
     parser.add_argument('--start_index', type=int, default=0,
@@ -155,15 +158,191 @@ def get_args_parser():
     parser.add_argument('--latest_root', type=str, default=None,
                         help='Root to scan for latest run containing checkpoint.pth and prototypes.pt.')
     parser.add_argument('--prune_unexpected_keys', action='store_true', help='When loading ckpt, drop keys not in model (default False).')
+    parser.add_argument('--seed', type=int, default=2022, help='Random seed for reproducibility (mini eval).')
+
+    # Stage C sanity ladder (diagnose noise: VAE/uncond/EEG/latent)
+    parser.add_argument('--sanity_checks', action='store_true', help='Run sanity ladder only (VAE roundtrip, uncond sample, EEG sample, latent stats).')
+    parser.add_argument('--sanity_items', type=int, default=2, help='Number of items for sanity checks (default 2).')
+    parser.add_argument('--sanity_ddim_steps', type=int, default=30, help='DDIM/PLMS steps for sanity sampling (default 30).')
+    parser.add_argument('--dump_first_batch', action='store_true', default=True, help='Dump first batch tensor stats when sanity_checks (default True).')
+    parser.add_argument('--no_dump_first_batch', action='store_true', help='Disable dump_first_batch.')
+    parser.add_argument('--also_run_eval', action='store_true', help='If set with --sanity_checks, run full eval after sanity; otherwise exit after sanity.')
 
     return parser
+
+
+def run_sanity_ladder(generative_model, dataset_test, output_path, device, args):
+    """Run Stage C sanity ladder: VAE roundtrip, unconditional sample, EEG sample, latent stats, cond stats, weights check."""
+    sanity_dir = os.path.join(output_path, 'sanity')
+    os.makedirs(sanity_dir, exist_ok=True)
+    n_items = min(getattr(args, 'sanity_items', 2), len(dataset_test))
+    steps = getattr(args, 'sanity_ddim_steps', 30)
+    dump_batch = not getattr(args, 'no_dump_first_batch', False)
+
+    model = generative_model.model.to(device)
+    model.eval()
+    cond_dim = getattr(generative_model, 'cond_dim', 768)
+    ldm_config = generative_model.ldm_config
+    C, H, W = ldm_config.model.params.channels, ldm_config.model.params.image_size, ldm_config.model.params.image_size
+    shape = (C, H, W)
+
+    # ----- (5) Weights check -----
+    unet_params = []
+    vae_params = []
+    for name, p in model.named_parameters():
+        if 'model.diffusion_model' in name:
+            unet_params.append(p.data.flatten())
+        elif 'first_stage_model' in name:
+            vae_params.append(p.data.flatten())
+    unet_flat = torch.cat(unet_params, 0) if unet_params else torch.tensor(0.0)
+    vae_flat = torch.cat(vae_params, 0) if vae_params else torch.tensor(0.0)
+    unet_mean = unet_flat.float().mean().item() if unet_flat.numel() else float('nan')
+    vae_mean = vae_flat.float().mean().item() if vae_flat.numel() else float('nan')
+    print("[SANITY][WEIGHTS] unet_param_mean=%.6f vae_param_mean=%.6f" % (unet_mean, vae_mean))
+
+    # ----- (3) Conditioning stats (one batch) -----
+    if n_items > 0:
+        item = dataset_test[0]
+        eeg = item['eeg']
+        if not isinstance(eeg, torch.Tensor):
+            eeg = torch.as_tensor(eeg, dtype=torch.float32, device=device)
+        else:
+            eeg = eeg.to(device)
+        if eeg.dim() == 2:
+            eeg = eeg.unsqueeze(0)
+        with torch.no_grad():
+            c, _ = model.get_learned_conditioning(eeg)
+        c_tensor = c if isinstance(c, torch.Tensor) else c.get(list(c.keys())[0], c)
+        if isinstance(c_tensor, (list, tuple)):
+            c_tensor = c_tensor[0]
+        csm = getattr(model, 'cond_stage_model', None)
+        if csm is not None:
+            extra = getattr(csm, '_sarhm_extra', {})
+            for name, t in [('c_base', extra.get('c_base')), ('c_sar', extra.get('c_sar')), ('c_final', c_tensor)]:
+                if t is not None:
+                    t = t.float()
+                    nan_inf = torch.isnan(t).any().item() or torch.isinf(t).any().item()
+                    if nan_inf:
+                        print("[SANITY][COND] *** %s contains NaN or Inf" % name)
+                    print("[SANITY][COND] %s mean=%.4f std=%.4f min=%.4f max=%.4f" % (
+                        name, t.mean().item(), t.std().item(), t.min().item(), t.max().item()))
+            alpha = extra.get('alpha')
+            if alpha is not None:
+                a = alpha.float()
+                print("[SANITY][COND] alpha min=%.4f mean=%.4f max=%.4f" % (a.min().item(), a.mean().item(), a.max().item()))
+        else:
+            c_tensor = c_tensor.float() if isinstance(c_tensor, torch.Tensor) else c_tensor
+            if torch.isnan(c_tensor).any() or torch.isinf(c_tensor).any():
+                print("[SANITY][COND] *** c_final contains NaN or Inf")
+            print("[SANITY][COND] c_final mean=%.4f std=%.4f min=%.4f max=%.4f" % (
+                c_tensor.mean().item(), c_tensor.std().item(), c_tensor.min().item(), c_tensor.max().item()))
+
+    # ----- (A) VAE roundtrip -----
+    if n_items > 0:
+        item = dataset_test[0]
+        img = item['image']
+        if isinstance(img, np.ndarray):
+            img = torch.from_numpy(img).float()
+        else:
+            img = torch.tensor(img, dtype=torch.float32)
+        if img.dim() == 3 and img.shape[-1] == 3:
+            img = rearrange(img, 'h w c -> 1 c h w')
+        elif img.dim() == 3:
+            img = img.unsqueeze(0)
+        img = img.to(device)
+        if img.max() <= 1.0 and img.min() >= 0.0:
+            img = img * 2.0 - 1.0
+        with torch.no_grad():
+            enc = model.encode_first_stage(img)
+            z = model.get_first_stage_encoding(enc)
+            rec = model.decode_first_stage(z.float())
+        rec = torch.clamp((rec + 1.0) / 2.0, 0.0, 1.0)
+        img_01 = torch.clamp((img + 1.0) / 2.0, 0.0, 1.0)
+        gt_np = (255. * rearrange(img_01[0], 'c h w -> h w c').cpu().numpy()).astype(np.uint8)
+        rec_np = (255. * rearrange(rec[0], 'c h w -> h w c').cpu().numpy()).astype(np.uint8)
+        Image.fromarray(gt_np).save(os.path.join(sanity_dir, 'vae_roundtrip_gt.png'))
+        Image.fromarray(rec_np).save(os.path.join(sanity_dir, 'vae_roundtrip_recon.png'))
+        print("[SANITY][VAE] gt min=%.4f max=%.4f mean=%.4f std=%.4f" % (
+            img_01.min().item(), img_01.max().item(), img_01.mean().item(), img_01.std().item()))
+        print("[SANITY][VAE] recon min=%.4f max=%.4f mean=%.4f std=%.4f" % (
+            rec.min().item(), rec.max().item(), rec.mean().item(), rec.std().item()))
+        rec_finite = torch.isfinite(rec).all().item()
+        print("[SANITY][VAE] recon finite=%s" % rec_finite)
+        if not rec_finite:
+            print("[SANITY][VAE] *** NaN/Inf detected in VAE reconstruction")
+
+    # ----- (B) Unconditional sample (zero conditioning) -----
+    sampler = PLMSSampler(model)
+    dtype = next(model.parameters()).dtype
+    c_zeros = torch.zeros(1, 77, cond_dim, device=device, dtype=dtype)
+    with model.ema_scope():
+        model.eval()
+        samples_z, _ = sampler.sample(S=steps, conditioning=c_zeros, batch_size=1, shape=shape, verbose=False)
+    z_final = samples_z
+    print("[SANITY][LATENT] z min=%.4f max=%.4f mean=%.4f std=%.4f finite=%s shape=%s" % (
+        z_final.min().item(), z_final.max().item(), z_final.mean().item(), z_final.std().item(),
+        torch.isfinite(z_final).all().item(), tuple(z_final.shape)))
+    if not torch.isfinite(z_final).all().item():
+        print("[SANITY][LATENT] *** NaN/Inf detected in latent z")
+    with torch.no_grad():
+        x_dec = model.decode_first_stage(z_final.float())
+    x_dec = torch.clamp((x_dec + 1.0) / 2.0, 0.0, 1.0)
+    print("[SANITY][DECODE] img min=%.4f max=%.4f mean=%.4f std=%.4f finite=%s" % (
+        x_dec.min().item(), x_dec.max().item(), x_dec.mean().item(), x_dec.std().item(), torch.isfinite(x_dec).all().item()))
+    if not torch.isfinite(x_dec).all().item():
+        print("[SANITY][DECODE] *** NaN/Inf detected in decoded image")
+    uncond_path = os.path.join(sanity_dir, 'uncond_sample_steps%d.png' % steps)
+    Image.fromarray((255. * rearrange(x_dec[0], 'c h w -> h w c').cpu().numpy()).astype(np.uint8)).save(uncond_path)
+    print("[SANITY][UNCOND] saved=%s steps=%d" % (uncond_path, steps))
+    print("[SANITY][UNCOND] mode=zero_cond (conditioning=zeros [1,77,%d])" % cond_dim)
+
+    # ----- (C) EEG-conditioned sample -----
+    if n_items > 0:
+        from torch.utils.data import Subset
+        subset_one = Subset(dataset_test, [0])
+        grid, samples = generative_model.generate(
+            subset_one, num_samples=1, ddim_steps=steps, HW=None, limit=1, state=None, output_path=None,
+            cfg_scale=1.0, cfg_uncond='zeros')
+        if samples is not None and samples.size > 0:
+            # samples shape (1, 2, C, H, W) -> gt + 1 gen
+            gen = samples[0, 1]
+            if gen.shape[0] == 3:
+                arr = (255. * np.transpose(gen, (1, 2, 0))).astype(np.uint8)
+            else:
+                arr = (255. * gen).astype(np.uint8)
+            eeg_path = os.path.join(sanity_dir, 'eeg_cond_sample_steps%d.png' % steps)
+            Image.fromarray(arr).save(eeg_path)
+            print("[SANITY][EEG] saved=%s steps=%d" % (eeg_path, steps))
+
+    # ----- dump_first_batch -----
+    if dump_batch and n_items > 0:
+        item = dataset_test[0]
+        for k, v in item.items():
+            if isinstance(v, torch.Tensor):
+                v = v.detach().float()
+                print("[SANITY][BATCH] %s shape=%s min=%.4f max=%.4f mean=%.4f" % (
+                    k, tuple(v.shape), v.min().item(), v.max().item(), v.mean().item()))
+            elif isinstance(v, np.ndarray):
+                print("[SANITY][BATCH] %s shape=%s dtype=%s" % (k, v.shape, v.dtype))
 
 
 if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()
+    if getattr(args, 'imagenet_path', None) is None and os.environ.get('IMAGENET_PATH'):
+        args.imagenet_path = os.environ.get('IMAGENET_PATH')
     root = args.root
     target = args.dataset
+    if target == 'EEG' and (not getattr(args, 'imagenet_path', None) or not str(getattr(args, 'imagenet_path', '')).strip()):
+        print("ERROR: dataset=EEG requires imagenet_path for real GT images.")
+        print("  Pass --imagenet_path /path/to/ILSVRC2012 or set IMAGENET_PATH.")
+        sys.exit(1)
+
+    seed = getattr(args, 'seed', 2022)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     # Optional: use latest run from generation dir and copy to exps/latest/
     if getattr(args, 'latest_run_dir', None):
@@ -201,6 +380,9 @@ if __name__ == '__main__':
     sd = torch.load(args.model_path, map_location='cpu', weights_only=False)
     config = sd['config']
     config.root_path = root
+    if getattr(args, 'ddim_steps', None) is not None:
+        config.ddim_steps = args.ddim_steps
+        print('[MINI_EVAL] ddim_steps overridden to %d' % args.ddim_steps)
 
     output_path = os.path.join(config.root_path, 'results', 'eval',
                     '%s'%(datetime.datetime.now().strftime("%d-%m-%Y-%H-%M-%S")))
@@ -252,6 +434,14 @@ if __name__ == '__main__':
                 splits_path=args.splits_path, imagenet_path=args.imagenet_path,
                 image_transform=[img_transform_train, img_transform_test], subject=4)
     num_voxels = dataset_test.dataset.data_len
+    max_test = getattr(args, 'max_test_items', 0) or 0
+    if max_test > 0:
+        from torch.utils.data import Subset
+        n_test = min(max_test, len(dataset_test))
+        if n_test == 0:
+            raise ValueError("[MINI_EVAL] max_test_items=%d but test split is empty." % max_test)
+        dataset_test = Subset(dataset_test, list(range(n_test)))
+        print('[MINI_EVAL] test_items=%d' % len(dataset_test))
     pbar.update(1)
 
     pbar.set_description('Load model')
@@ -525,6 +715,15 @@ if __name__ == '__main__':
         except Exception as e:
             print('attention plot skip:', e)
 
+    # ----- Sanity ladder: run first, then exit unless also_run_eval -----
+    if getattr(args, 'sanity_checks', False):
+        print("[SANITY] Running Stage C sanity ladder (sanity_items=%d, sanity_ddim_steps=%d) ..." % (
+            getattr(args, 'sanity_items', 2), getattr(args, 'sanity_ddim_steps', 30)))
+        run_sanity_ladder(generative_model, dataset_test, output_path, device, args)
+        if not getattr(args, 'also_run_eval', False):
+            print("[SANITY] Ladder done. Exiting (--also_run_eval not set).")
+            sys.exit(0)
+
     pbar.set_description('Generate train')
     num_samples = getattr(args, 'num_samples', None) or getattr(config, 'num_samples', 5)
     split = getattr(args, 'split', 'test')
@@ -544,7 +743,9 @@ if __name__ == '__main__':
 
     pbar.set_description('Generate test')
     limit_test = None
-    if getattr(args, 'max_test_items', None) is not None:
+    if getattr(args, 'max_test_items', 0) and args.max_test_items > 0:
+        limit_test = None  # already sliced dataset_test in [MINI_EVAL]; generate full subset
+    elif getattr(args, 'max_test_items', None) is not None and args.max_test_items != 0:
         limit_test = args.max_test_items
     elif getattr(args, 'max_items', None) is not None:
         limit_test = args.max_items

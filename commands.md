@@ -72,16 +72,19 @@ python code/eeg_ldm.py --num_epoch 10 --model sarhm --seed 2022 --run_name sarhm
 
 ## 3. Complete / full training: how many epochs?
 
-**500 epochs** is the **default** in config (full reproduction, original setup). It is **not mandatory** for good thesis results.
+**500 epochs** is the **config default** (full reproduction, original setup). It is a **safe upper bound** for best convergence but **not mandatory** for good thesis results. Comparable quality is often reached earlier (e.g. 200–350 epochs); use Stage C eval at fixed checkpoints to decide.
 
 | Epochs | Use case | Typical quality / time |
 |--------|----------|--------------------------|
 | **10** | Fast comparison, ablations, debugging | Good for tables/figures; may underfit. |
-| **50–100** | Strong thesis results, reasonable time | Often enough for good FID/CLIP; recommended starting point. |
-| **150–200** | High quality, full convergence on many setups | Safe choice for main thesis numbers. |
-| **500** | Full reproduction, paper/default | Best convergence; long runtime. |
+| **50–100** | Strong thesis results, reasonable time | Often enough for good CLIP/SSIM; recommended starting point. |
+| **150–200** | High quality, convergence on many setups | Safe choice for main thesis numbers. |
+| **200–350** | Typical range where metrics plateau | Compare Stage C at 200 vs 300; if similar, stop. |
+| **500** | Full reproduction, paper default | Safe upper bound; run if you need best possible convergence. |
 
-**Recommendation:** Use **100–150 epochs** for main thesis results unless you need exact reproduction of a 500-epoch run. You can always extend later from a checkpoint.
+**Recommendation:** Use **200–300 epochs** as a default target; run Stage C at 250 steps on a fixed test subset (same seed, e.g. `--max_test_items 20`, `--num_samples 1`). If SSIM/CLIP and qualitative images plateau, that is sufficient. Extend to 400–500 only if you need to squeeze out the last bit of quality. You can always extend later from a checkpoint.
+
+**Evaluation checkpoints:** To decide manually when to stop (no early-stopping code): run Stage C on checkpoints at different epoch counts (e.g. 100, 200, 300, 400, 500) using the same seed and test subset; compare metrics (SSIM, PCC, CLIP) and qualitative images. See **docs/EPOCH_RECOMMENDATION.md** for a “How to decide if enough epochs” checklist.
 
 ---
 
