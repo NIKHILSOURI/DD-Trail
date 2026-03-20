@@ -105,20 +105,24 @@ class HopfieldRetrieval(nn.Module):
     """
     Hopfield-style retrieval: query q, memory P (class prototypes).
     similarity = q @ P^T; attention = softmax(similarity / tau); r = attention @ P.
-    Returns: (retrieved [B,dim], attention_weights [B,K], logits [B,K]).
+    Optional top_k: use only top-k keys by similarity (limits retrieval strength).
+    Returns: (retrieved [B,dim], attention_weights [B,K or top_k], logits [B,K]).
     """
 
-    def __init__(self, tau: float = 1.0):
+    def __init__(self, tau: float = 1.0, top_k: Optional[int] = None):
         super().__init__()
         self.tau = tau
+        self.top_k = top_k  # None = use all keys; int = use only top-k by similarity
 
     def forward(
         self,
         query: torch.Tensor,
         memory: Union[ClassPrototypes, torch.Tensor],
+        top_k: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         query: [B, dim], memory: ClassPrototypes or [K, dim]
+        top_k: override instance top_k; when set, attention is over top-k keys only.
         """
         if isinstance(memory, ClassPrototypes):
             P = memory.P
@@ -126,9 +130,23 @@ class HopfieldRetrieval(nn.Module):
             P = memory
         if query.dim() == 3:
             query = query.mean(dim=1)
-        logits = torch.matmul(query, P.t()) / max(self.tau, 1e-8)
-        attn = F.softmax(logits, dim=-1)
-        retrieved = torch.matmul(attn, P)
+        K = P.shape[0]
+        k_use = top_k if top_k is not None else self.top_k
+        if k_use is not None and k_use < K:
+            # Limit retrieval to top-k keys per query (softer attention, limits strength)
+            logits_full = torch.matmul(query, P.t()) / max(self.tau, 1e-8)
+            topk_vals, topk_idx = logits_full.topk(k_use, dim=-1)
+            attn_k = F.softmax(topk_vals, dim=-1)
+            P_expand = P.unsqueeze(0).expand(query.shape[0], -1, -1)
+            P_topk = torch.gather(P_expand, 1, topk_idx.unsqueeze(-1).expand(-1, -1, P.shape[-1]))
+            retrieved = torch.bmm(attn_k.unsqueeze(1), P_topk).squeeze(1)
+            logits = logits_full
+            attn = torch.zeros_like(logits_full, device=logits_full.device, dtype=logits_full.dtype)
+            attn.scatter_(1, topk_idx, attn_k)
+        else:
+            logits = torch.matmul(query, P.t()) / max(self.tau, 1e-8)
+            attn = F.softmax(logits, dim=-1)
+            retrieved = torch.matmul(attn, P)
         return retrieved, attn, logits
 
 

@@ -545,6 +545,9 @@ class DDPM(pl.LightningModule):
                     HW=getattr(main_cfg, 'HW', None), limit=val_limit,
                     debug_sampling_steps=debug_steps, debug_save_dir=debug_dir)
                 if all_samples is not None and len(all_samples) > 0:
+                    # Store for epoch-stats callback (SAR-HM improved: best-by-CLIP, epoch_stats CSV)
+                    setattr(self, '_last_val_samples', all_samples)
+                    setattr(self, '_last_val_epoch', current_epoch)
                     # Single-image mode: save exactly one final image per epoch to val_images/epoch_XXX.png
                     output_path = getattr(self, 'output_path', None) or (getattr(main_cfg, 'output_path', None) if main_cfg else None)
                     if output_path and val_limit == 1 and val_num_samples == 1:
@@ -1142,6 +1145,13 @@ class LatentDiffusion(DDPM):
             else:
                 return self.first_stage_model.decode(z)
 
+    def _decode_first_stage_allow_grad(self, z):
+        """Decode latent to image allowing gradients (for SAR-HM++ generated-image CLIP loss)."""
+        z = 1. / self.scale_factor * z
+        if isinstance(self.first_stage_model, VQModelInterface):
+            return self.first_stage_model.decode(z, force_not_quantize=True)
+        return self.first_stage_model.decode(z)
+
     @torch.no_grad()
     def encode_first_stage(self, x):
         return self.first_stage_model.encode(x)
@@ -1150,14 +1160,21 @@ class LatentDiffusion(DDPM):
         self.freeze_first_stage()
         x, c, label, image_raw = self.get_input(batch, self.first_stage_key)
         target_embeds = batch.get('target_embeds')
+        z_sem_gt = batch.get('z_sem_gt')
+        clip_img_embed_gt = batch.get('clip_img_embed_gt')
+        summary_embed_gt = batch.get('summary_embed_gt')
+        has_semantic_gt = batch.get('has_semantic_gt')
         if self.return_cond:
-            loss, cc = self(x, c, label, image_raw, target_embeds=target_embeds)
+            loss, cc = self(x, c, label, image_raw, target_embeds=target_embeds, z_sem_gt=z_sem_gt,
+                            clip_img_embed_gt=clip_img_embed_gt, summary_embed_gt=summary_embed_gt, has_semantic_gt=has_semantic_gt)
             return loss, cc
         else:
-            loss = self(x, c, label, image_raw, target_embeds=target_embeds)
+            loss = self(x, c, label, image_raw, target_embeds=target_embeds, z_sem_gt=z_sem_gt,
+                        clip_img_embed_gt=clip_img_embed_gt, summary_embed_gt=summary_embed_gt, has_semantic_gt=has_semantic_gt)
             return loss
 
-    def forward(self, x, c, label, image_raw, target_embeds=None, *args, **kwargs):
+    def forward(self, x, c, label, image_raw, target_embeds=None, z_sem_gt=None,
+                clip_img_embed_gt=None, summary_embed_gt=None, has_semantic_gt=None, *args, **kwargs):
         # print(self.num_timesteps)
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         # print('t.shape')
@@ -1173,7 +1190,27 @@ class LatentDiffusion(DDPM):
                 # print(c.shape)
 
         prefix = 'train' if self.training else 'val'
-        loss, loss_dict = self.p_losses(x, c, t, *args, **kwargs)
+        main_cfg_pp = getattr(self, 'main_config', None)
+        need_x0 = (
+            main_cfg_pp is not None
+            and getattr(main_cfg_pp, 'use_sarhmpp', False)
+            and not getattr(main_cfg_pp, 'no_clip_loss', False)
+            and clip_img_embed_gt is not None
+            and summary_embed_gt is not None
+            and (getattr(getattr(self, 'trainer', None), 'global_step', 0) % max(1, getattr(main_cfg_pp, 'clip_loss_every_n_steps', 1)) == 0)
+            and (has_semantic_gt is None or (has_semantic_gt.dim() > 0 and has_semantic_gt.any()))
+        )
+        if need_x0:
+            loss, loss_dict, x0_pred = self.p_losses(x, c, t, return_x0_pred=True)
+        else:
+            loss, loss_dict = self.p_losses(x, c, t)
+            x0_pred = None
+        # SAR-HM improved: optional scaling of diffusion loss (default 1.0 for backward compat)
+        main_cfg = getattr(self, 'main_config', None)
+        lam_diff = getattr(main_cfg, 'lambda_diffusion', 1.0) if main_cfg else 1.0
+        if lam_diff != 1.0:
+            loss = loss * lam_diff
+            loss_dict.update({f'{prefix}/loss_diffusion_scaled': loss.detach()})
         if hasattr(self, '_sarhm_metrics_hook') and callable(self._sarhm_metrics_hook):
             try:
                 sarhm = self._sarhm_metrics_hook(self.cond_stage_model, label)
@@ -1202,9 +1239,73 @@ class LatentDiffusion(DDPM):
                 L_retrieval = F.cross_entropy(logits, lbl)
                 loss = loss + lam_r * L_retrieval
                 loss_dict.update({f'{prefix}/loss_retrieval': L_retrieval})
+        # SAR-HM++: L_sem_align(q_sem, z_sem_gt) and L_retr(m_sem, z_sem_gt). Training-only; batch must contain z_sem_gt.
+        main_cfg_pp = getattr(self, 'main_config', None)
+        if main_cfg_pp and getattr(main_cfg_pp, 'use_sarhmpp', False) and z_sem_gt is not None:
+            try:
+                from sarhm.semantic_losses import compute_semantic_losses
+                extra = getattr(self.cond_stage_model, '_sarhm_extra', {})
+                q_sem = extra.get('q_sem')
+                m_sem = extra.get('m_sem')
+                if q_sem is not None and m_sem is not None:
+                    z_sem_gt = z_sem_gt.to(q_sem.device).float()
+                    if z_sem_gt.dim() == 2 and q_sem.dim() == 2 and z_sem_gt.shape[0] == q_sem.shape[0]:
+                        lam_retr = 0.0 if getattr(main_cfg_pp, 'no_retrieval_loss', False) else getattr(main_cfg_pp, 'lambda_retr', 0.1)
+                        lam_clip_img = 0.0 if getattr(main_cfg_pp, 'no_clip_loss', False) else getattr(main_cfg_pp, 'lambda_clip_img', 0.2)
+                        lam_clip_text = 0.0 if getattr(main_cfg_pp, 'no_clip_loss', False) else getattr(main_cfg_pp, 'lambda_clip_text', 0.1)
+                        L_sem_total, sem_loss_dict = compute_semantic_losses(
+                            q_sem=q_sem, m_sem=m_sem, z_sem_gt=z_sem_gt,
+                            lambda_sem=getattr(main_cfg_pp, 'lambda_sem', 0.1),
+                            lambda_retr=lam_retr,
+                            lambda_clip_img=lam_clip_img,
+                            lambda_clip_text=lam_clip_text,
+                        )
+                        loss = loss + L_sem_total
+                        for k, v in sem_loss_dict.items():
+                            loss_dict.update({f'{prefix}/{k}': v})
+            except Exception:
+                pass
+        # SAR-HM++: L_clip_img and L_clip_text from decoded generated image (when x0_pred and GT embeds available)
+        if x0_pred is not None and clip_img_embed_gt is not None and summary_embed_gt is not None and main_cfg_pp is not None and getattr(main_cfg_pp, 'use_sarhmpp', False) and not getattr(main_cfg_pp, 'no_clip_loss', False):
+            try:
+                decoded = self._decode_first_stage_allow_grad(x0_pred)
+                if decoded is not None:
+                    decoded_01 = (decoded.float() + 1.0).mul(0.5).clamp(0.0, 1.0)
+                    if not hasattr(self, '_clip_gen_cache') or self._clip_gen_cache is None:
+                        from sarhm.semantic_targets import _get_clip_encoder
+                        self._clip_gen_cache = _get_clip_encoder(self.device)
+                    clip_model, clip_processor = self._clip_gen_cache
+                    from sarhm.semantic_targets import extract_clip_image_embed
+                    clip_img_gen = extract_clip_image_embed(decoded_01, clip_model, clip_processor, self.device, allow_grad=True)
+                    gt_img = clip_img_embed_gt.to(self.device).float()
+                    gt_text = summary_embed_gt.to(self.device).float()
+                    if has_semantic_gt is not None and has_semantic_gt.dim() > 0:
+                        mask = has_semantic_gt.to(self.device)
+                        if mask.any():
+                            clip_img_gen = clip_img_gen[mask]
+                            gt_img = gt_img[mask]
+                            gt_text = gt_text[mask]
+                        else:
+                            clip_img_gen = None
+                    if clip_img_gen is not None and clip_img_gen.shape[0] > 0:
+                        from sarhm.semantic_losses import compute_semantic_losses
+                        lam_i = getattr(main_cfg_pp, 'lambda_clip_img', 0.2)
+                        lam_t = getattr(main_cfg_pp, 'lambda_clip_text', 0.1)
+                        L_clip_total, clip_loss_dict = compute_semantic_losses(
+                            lambda_clip_img=lam_i, lambda_clip_text=lam_t,
+                            clip_img_gen=clip_img_gen, clip_img_gt=gt_img, clip_text_gt=gt_text,
+                        )
+                        for k, v in clip_loss_dict.items():
+                            loss_dict.update({f'{prefix}/{k}': v})
+                        loss = loss + L_clip_total
+            except Exception:
+                pass
         # pre_cls = self.cond_stage_model.get_cls(re_latent)
         # rencon = self.cond_stage_model.recon(re_latent)
-        if self.clip_tune and re_latent is not None:
+        # CLIP loss (EEG->cond vs image embed). To give higher priority to CLIP, increase lambda_clip (e.g. 0.5 or 1.0).
+        main_cfg_clip = getattr(self, 'main_config', None)
+        lam_clip = getattr(main_cfg_clip, 'lambda_clip', 0.2) if main_cfg_clip else 0.2
+        if self.clip_tune and re_latent is not None and not getattr(main_cfg_clip, 'no_clip_loss', False):
             if target_embeds is not None:
                 image_embeds = target_embeds.to(self.device) if hasattr(target_embeds, 'to') else target_embeds
             else:
@@ -1214,8 +1315,10 @@ class LatentDiffusion(DDPM):
                     image_embeds = None
             if image_embeds is not None:
                 loss_clip = self.cond_stage_model.get_clip_loss(re_latent, image_embeds)
-                loss += loss_clip
-                loss_dict.update({f'{prefix}/loss_clip': loss_clip})
+                loss_dict.update({f'{prefix}/loss_clip_raw': loss_clip})
+                loss_clip_weighted = lam_clip * loss_clip
+                loss += loss_clip_weighted
+                loss_dict.update({f'{prefix}/loss_clip': loss_clip_weighted})
         if self.cls_tune and re_latent is not None and hasattr(self.cond_stage_model, 'cls_net') and self.cond_stage_model.cls_net is not None:
             pre_cls = self.cond_stage_model.get_cls(re_latent)
             loss_cls = self.cls_loss(label, pre_cls)
@@ -1298,14 +1401,9 @@ class LatentDiffusion(DDPM):
         kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def p_losses(self, x_start, cond, t, noise=None):
+    def p_losses(self, x_start, cond, t, noise=None, return_x0_pred=False):
         noise = default(noise, lambda: torch.randn_like(x_start))
-        # print('p_losses')
-        # print('noise.shape')
-        # print(noise.shape)
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        # print('x_noisy[0].shape')
-        # print(x_noisy[0].shape)
         model_output = self.apply_model(x_noisy, t, cond)
 
         loss_dict = {}
@@ -1321,11 +1419,9 @@ class LatentDiffusion(DDPM):
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
-        # Index with t.cpu() to avoid device mismatch when buffers are on CPU (e.g. Lightning)
         t_cpu = t.cpu()
         logvar_t = self.logvar[t_cpu].to(t.device)
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
-        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
             loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
             loss_dict.update({'logvar': self.logvar.data.mean()})
@@ -1338,6 +1434,12 @@ class LatentDiffusion(DDPM):
         loss += (self.original_elbo_weight * loss_vlb)
         loss_dict.update({f'{prefix}/loss': loss})
 
+        if return_x0_pred:
+            if self.parameterization == "eps":
+                x0_pred = self.predict_start_from_noise(x_noisy, t=t, noise=model_output)
+            else:
+                x0_pred = model_output
+            return loss, loss_dict, x0_pred
         return loss, loss_dict
 
     def p_mean_variance(self, x, c, t, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,

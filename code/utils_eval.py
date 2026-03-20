@@ -16,7 +16,12 @@ from einops import rearrange
 try:
     from utils.state_dict_utils import filter_state_dict_for_model, log_filter_info
 except ImportError:
-    from code.utils.state_dict_utils import filter_state_dict_for_model, log_filter_info
+    import sys
+    from pathlib import Path
+    _CODE_DIR = Path(__file__).resolve().parent
+    if str(_CODE_DIR) not in sys.path:
+        sys.path.insert(0, str(_CODE_DIR))
+    from utils.state_dict_utils import filter_state_dict_for_model, log_filter_info
 
 
 def set_seed(seed: int) -> None:
@@ -65,6 +70,15 @@ def load_model(
     if config is None:
         config = Config_Generative_Model()
     # else use checkpoint config as-is (may be namespace or have __dict__)
+
+    # SAR-HM++: set semantic_prototypes_path from checkpoint dir if not set (for compare_eval / eval with SAR-HM++ ckpt)
+    if getattr(config, "use_sarhmpp", False) and not getattr(config, "semantic_prototypes_path", None):
+        ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+        for name in ("semantic_prototypes.pt", "prototypes.pt"):
+            candidate = os.path.join(ckpt_dir, name)
+            if os.path.isfile(candidate):
+                setattr(config, "semantic_prototypes_path", candidate)
+                break
 
     num_voxels = num_voxels if num_voxels is not None else 512
 

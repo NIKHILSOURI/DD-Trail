@@ -1,10 +1,11 @@
-# DreamDiffusion + SAR-HM: EEG-to-Image Generation
+# DreamDiffusion + SAR-HM + SAR-HM++: EEG-to-Image Generation
 
 DreamDiffusion is an **EEG-conditioned** variant of Stable Diffusion that reconstructs visual stimuli from brain signals. This repository contains:
 
 - **Baseline DreamDiffusion** (EEG → conditioning → SD 1.5 UNet)
-- **SAR-HM** (*Semantic Associative Retrieval with Hopfield Memory*) extension
-- End-to-end scripts for **training** (Stage A1 + Stage B), **generation/evaluation** (Stage C), and **baseline vs SAR-HM comparison + plotting** (no retraining needed once results exist)
+- **SAR-HM** (*Semantic Associative Retrieval with Hopfield Memory*) — class prototypes + Hopfield retrieval + confidence-gated fusion
+- **SAR-HM++** (*Multi-Level Semantic Prototype Retrieval*) — multi-level semantic memory, top-k retrieval, semantic adapter, and optional **semantic teacher supervision** (L_sem_align, L_retr, L_clip_img, L_clip_text from decoded generated images)
+- End-to-end scripts for **training** (Stage A1 + Stage B), **generation/evaluation** (Stage C), and **baseline vs SAR-HM vs SAR-HM++ comparison + plotting** (no retraining needed once results exist)
 
 > **Note:** `datasets/` and `pretrains/` are not included in the repo. See **Data & Pretrained Weights** below.
 
@@ -18,8 +19,9 @@ DreamDiffusion is an **EEG-conditioned** variant of Stable Diffusion that recons
   - [Stage A1: EEG Encoder Pretraining](#stage-a1-eeg-encoder-pretraining)
   - [Stage B: Fine-tuning Stable Diffusion](#stage-b-fine-tuning-stable-diffusion)
   - [Stage C: EEG-to-Image Generation & Evaluation](#stage-c-eeg-to-image-generation--evaluation)
-  - [Compare-Eval: Baseline vs SAR-HM](#compare-eval-baseline-vs-sar-hm)
+  - [Compare-Eval: Baseline vs SAR-HM vs SAR-HM++](#compare-eval-baseline-vs-sar-hm-vs-sar-hm)
   - [Graphs: Thesis-Quality Plots](#graphs-thesis-quality-plots)
+- [Unified Benchmark (ThoughtViz, DreamDiffusion, SAR-HM)](#unified-benchmark-thoughtviz-dreamdiffusion-sar-hm)
 - [Results (Thesis Runs)](#results-thesis-runs)
 - [Repository Structure](#repository-structure)
 - [Data & Pretrained Weights](#data--pretrained-weights)
@@ -36,9 +38,11 @@ DreamDiffusion is an **EEG-conditioned** variant of Stable Diffusion that recons
 - **Stage A1**: Pre-train an EEG encoder (masked modeling / representation learning).
 - **Stage B**: Fine-tune a Latent Diffusion Model (Stable Diffusion 1.5 backbone) using EEG conditioning:
   - **Baseline**: original DreamDiffusion EEG-conditioning path
-  - **SAR-HM**: adds CLIP-space projection + Hopfield retrieval over class prototypes + confidence-gated fusion
-- **Stage C**: Generate images from EEG and compute metrics using saved checkpoints.
-- **Compare-eval + graphs**: Create **final tables/figures** from existing outputs (no retraining).
+  - **SAR-HM**: CLIP-space projection + Hopfield retrieval over class prototypes + confidence-gated fusion
+  - **SAR-HM++**: multi-level semantic prototypes + semantic query → top-k retrieval → adapter → confidence-gated fusion; optional **semantic targets in batch** (z_sem_gt, clip_img_embed_gt, summary_embed_gt) and **CLIP losses on decoded generated images** (L_clip_img, L_clip_text) for better semantic fidelity
+- **Stage C**: Generate images from EEG and compute metrics using saved checkpoints. **Inference is EEG-only** (no GT semantic leakage).
+- **Compare-eval + graphs**: Create **final tables/figures** from existing outputs; supports baseline vs SAR-HM vs SAR-HM++ (no retraining).
+- **Unified Benchmark**: Fair comparison of **ThoughtViz**, **DreamDiffusion baseline**, and **DreamDiffusion + SAR-HM** on **ImageNet-EEG** and **ThoughtViz** datasets. Single sanity test, small (10–20 sample) runs, metrics, tables, and qualitative panels. See [Unified Benchmark](#unified-benchmark-thoughtviz-dreamdiffusion-sar-hm) and `docs/commands.md`, `docs/benchmark_workflow.md`. *This benchmark uses only normal SAR-HM; SAR-HM++ is separate (future work).*
 
 ---
 
@@ -129,14 +133,6 @@ python code/eeg_ldm.py \
 
 #### SAR-HM (full_sarhm, thesis-level)
 
-In `code/config.py` set:
-
-- `use_sarhm = True`
-- `ablation_mode = "full_sarhm"`
-- `num_classes = 40`
-
-Then run:
-
 ```bash
 python code/eeg_ldm.py \
   --num_epoch 500 \
@@ -144,12 +140,45 @@ python code/eeg_ldm.py \
   --num_workers 8 \
   --precision bf16 \
   --model sarhm \
+  --run_mode sarhm \
   --seed 2022 \
   --eval_every 2 \
   --num_eval_samples 50 \
-  --use_sarhm true \
   --ablation_mode full_sarhm
 ```
+
+#### SAR-HM++ (multi-level semantic retrieval + semantic teacher losses)
+
+**1. Build semantic targets and prototypes (once, offline):**
+
+```bash
+python code/build_semantic_targets.py \
+  --eeg_signals_path datasets/eeg_5_95_std.pth \
+  --splits_path datasets/block_splits_by_image_single.pth \
+  --imagenet_path /path/to/ILSVRC2012 \
+  --out_path datasets/semantic_targets.pt
+
+python code/build_semantic_prototypes.py \
+  --semantic_targets_path datasets/semantic_targets.pt \
+  --out_path datasets/semantic_prototypes.pt
+```
+
+**2. Train with SAR-HM++ (semantic targets in batch enable L_sem_align, L_retr, L_clip_img, L_clip_text):**
+
+```bash
+python code/eeg_ldm.py \
+  --run_mode sarhmpp \
+  --semantic_prototypes_path datasets/semantic_prototypes.pt \
+  --semantic_targets_path datasets/semantic_targets.pt \
+  --imagenet_path /path/to/ILSVRC2012 \
+  --splits_path datasets/block_splits_by_image_single.pth \
+  --eeg_signals_path datasets/eeg_5_95_std.pth \
+  --num_epoch 500 \
+  --batch_size 16 \
+  --seed 2022
+```
+
+The train dataset is automatically wrapped with **SemanticTargetWrapper** when `use_sarhmpp` and `semantic_targets_path` are set; each batch then includes `z_sem_gt`, `clip_img_embed_gt`, `summary_embed_gt`, and `has_semantic_gt`. L_clip_img and L_clip_text are computed from **decoded generated images** (configurable via `clip_loss_every_n_steps`). Inference remains **EEG-only** (no GT semantics).
 
 > For smoke tests: lower `--num_epoch` (e.g., `10`) and/or `--batch_size` (e.g., `4–8`).
 
@@ -184,9 +213,11 @@ Outputs:
 
 ---
 
-### Compare-Eval: Baseline vs SAR-HM
+### Compare-Eval: Baseline vs SAR-HM vs SAR-HM++
 
-Re-run side-by-side comparison (metrics + grids):
+Re-run side-by-side comparison (metrics + grids). Same EEG subset and seed for all models.
+
+**Two-model (baseline vs SAR-HM):**
 
 ```bash
 python code/compare_eval.py --dataset EEG \
@@ -196,11 +227,10 @@ python code/compare_eval.py --dataset EEG \
   --baseline_ckpt results/exps/results/generation/02-03-2026-01-49-36/checkpoint_best.pth \
   --sarhm_ckpt   results/exps/results/generation/02-03-2026-09-57-39/checkpoint_best.pth \
   --sarhm_proto  results/exps/results/generation/02-03-2026-09-57-39/prototypes.pt \
-  --n_samples 5 \
-  --ddim_steps 250 \
-  --seed 2022 \
-  --out_dir results/compare_eval_thesis
+  --n_samples 5 --ddim_steps 250 --seed 2022 --out_dir results/compare_eval_thesis
 ```
+
+**SAR-HM++ checkpoint:** Use `--sarhm_ckpt` with a SAR-HM++ checkpoint; prototypes are auto-detected from the checkpoint directory (`semantic_prototypes.pt` or `prototypes.pt`) or set explicitly with `--sarhmpp_proto`.
 
 Outputs:
 
@@ -228,6 +258,40 @@ python tools/make_optional_graphs.py \
   --results_dir results \
   --out_dir graphs/optional
 ```
+
+---
+
+## Unified Benchmark (ThoughtViz, DreamDiffusion, SAR-HM)
+
+A **unified benchmark** allows fair comparison of three EEG-to-image models on two datasets. **Only normal SAR-HM** is used in this benchmark (no SAR-HM++; that is separate/future work).
+
+### Models and datasets
+
+| Models | Description |
+|--------|-------------|
+| **ThoughtViz** | GAN-based (official repo under `code/ThoughtViz/`); EEG classifier encoding + generator. |
+| **DreamDiffusion baseline** | EEG → MAE → conditioning → Stable Diffusion 1.5. |
+| **DreamDiffusion + SAR-HM** | Same as baseline + Hopfield retrieval over class prototypes + confidence-gated fusion. |
+
+| Datasets | Description |
+|----------|-------------|
+| **ImageNet-EEG** | EEG signals + ImageNet GT images; splits from `block_splits_*.pth`. |
+| **ThoughtViz** | ThoughtViz data (`data.pkl` + images by class under `code/ThoughtViz/`). |
+
+### Benchmark layout
+
+- **Sanity test:** `python tests/test_full_pipeline_sanity.py` — checks dataset load, model load, one-sample inference, and metrics. Set `IMAGENET_PATH`, `BASELINE_CKPT`, `SARHM_CKPT`, `SARHM_PROTO` as needed.
+- **Small benchmark (10–20 samples):** `python -m benchmark.compare_all_models --dataset imagenet_eeg --max_samples 10 --run_name smoke_test --imagenet_path <path> --baseline_ckpt <path> --sarhm_ckpt <path> --sarhm_proto <path>`
+- **Outputs:** Standardized under `results/benchmark_outputs/<dataset>/sample_<id>/` with `ground_truth.png`, `thoughtviz.png`, `dreamdiffusion.png`, `sarhm.png`, and `metadata.json`. Optional: `results/experiments/<run_name>/` for metrics, timing, tables, and panels.
+
+### Documentation and commands
+
+- **Exact runnable commands:** `docs/commands.md` (sanity, small benchmark, ThoughtViz train/test, DreamDiffusion/SAR-HM, comparison, metrics, tables).
+- **ThoughtViz integration:** `docs/thoughtviz_integration.md` (wrapper API, data paths, dependencies).
+- **Benchmark workflow:** `docs/benchmark_workflow.md` (phases: sanity → small benchmark → multi-run → final comparison; folder structure; MSC/optional metrics).
+- **Inspection and plan:** `docs/BENCHMARK_INSPECTION_AND_PLAN.md` (implementation plan and file map).
+
+Ensure `code` and `benchmark` are on `PYTHONPATH` (e.g. run from repo root with `export PYTHONPATH=code:benchmark:$PYTHONPATH` or `pip install -e ./code`).
 
 ---
 
@@ -339,27 +403,72 @@ High-level structure (key files only):
 │   ├── dataset.py                     # Dataset loading helpers
 │   ├── eval_metrics.py                # Metrics utilities
 │   ├── config.py                      # Main configuration (including SAR-HM flags)
+│   ├── thoughtviz_integration/        # ThoughtViz wrapper for unified benchmark
+│   │   ├── __init__.py                # get_thoughtviz_root
+│   │   ├── config.py                  # ThoughtVizConfig
+│   │   ├── dataset_adapter.py         # ThoughtVizDatasetAdapter, unified sample interface
+│   │   ├── model_wrapper.py           # ThoughtVizWrapper (load, generate_from_eeg, save_outputs)
+│   │   ├── inference.py               # Thin inference entry
+│   │   └── utils.py                   # Path resolution, availability check
 │   ├── sc_mbm/
 │   │   ├── mae_for_eeg.py
 │   │   ├── trainer.py
 │   │   └── utils.py
 │   ├── sarhm/
-│   │   ├── sarhm_modules.py           # Hopfield retrieval + gating modules
+│   │   ├── sarhm_modules.py           # Hopfield retrieval + gating (SAR-HM)
 │   │   ├── prototypes.py              # Prototype creation/IO
+│   │   ├── semantic_dataset_wrapper.py # SAR-HM++: wrap train set with z_sem_gt, clip_img_embed_gt, etc.
+│   │   ├── semantic_targets.py        # SAR-HM++: CLIP extraction, fuse_semantic_target, load/save semantic_targets.pt
+│   │   ├── semantic_memory.py         # SAR-HM++: SemanticMemoryBank, semantic_prototypes.pt
+│   │   ├── semantic_query.py          # SAR-HM++: SemanticQueryHead, pool_eeg_for_query
+│   │   ├── semantic_adapter.py        # SAR-HM++: m_sem → [B,77,768]
+│   │   ├── semantic_losses.py         # SAR-HM++: L_sem_align, L_retr, L_clip_img, L_clip_text
 │   │   ├── metrics_logger.py          # Logging hooks (retrieval acc, entropy, etc.)
 │   │   └── vis.py                     # Visualizations
+│   ├── build_semantic_targets.py      # Offline: build semantic_targets.pt from dataset images
+│   ├── build_semantic_prototypes.py   # Offline: build semantic_prototypes.pt from semantic_targets.pt
+│   ├── ThoughtViz/                   # (optional) official ThoughtViz repo clone for benchmark
 │   └── dc_ldm/
 │       ├── ldm_for_eeg.py
 │       ├── utils.py
 │       ├── models/                    # adopted from LDM
 │       └── modules/                   # adopted from LDM
 │
+├── benchmark/                         # Unified benchmark (ThoughtViz, DreamDiffusion, SAR-HM)
+│   ├── __init__.py
+│   ├── benchmark_config.py            # BenchmarkConfig
+│   ├── benchmark_runner.py            # run_one_model, run_all_models
+│   ├── dataset_registry.py            # get_dataset (imagenet_eeg, thoughtviz)
+│   ├── model_registry.py              # get_model, generate_dreamdiffusion, generate_thoughtviz
+│   ├── output_standardizer.py         # Standardized outputs (ground_truth.png, model.png, metadata.json)
+│   ├── metrics_runner.py              # Core metrics (SSIM, PCC, CLIP)
+│   ├── timing_runner.py               # Inference timing
+│   ├── table_generator.py            # Tables (ImageNet-EEG, ThoughtViz, timing)
+│   ├── visualization_runner.py        # Qualitative comparison panels
+│   ├── compare_all_models.py          # CLI: run benchmark, --max_samples, --dataset, --models
+│   ├── segmentation_eval.py           # Instance segmentation comparison (stub)
+│   ├── caption_eval.py                # Image summary/caption comparison (stub)
+│   └── utils.py                      # Logging, paths, JSON I/O
+│
+├── tests/
+│   ├── __init__.py
+│   └── test_full_pipeline_sanity.py   # Dataset, model load, one-sample inference, metrics sanity
+│
 ├── tools/
 │   ├── make_graphs.py                 # main thesis graphs from logs + compare_eval outputs
 │   └── make_optional_graphs.py        # optional/advanced plots (ablations, std across seeds)
 │
 ├── docs/
+│   ├── commands.md                    # Runnable commands: sanity, small benchmark, ThoughtViz, DreamDiffusion, SAR-HM, comparison
+│   ├── thoughtviz_integration.md      # ThoughtViz wrapper, data paths, dependencies
+│   ├── benchmark_workflow.md          # Benchmark phases, folder structure, MSC/optional metrics
+│   ├── BENCHMARK_INSPECTION_AND_PLAN.md  # Benchmark implementation plan and file map
 │   ├── SARHM_README.md                # SAR-HM configuration + dataset policy
+│   ├── SARHM_IMPROVED.md              # SAR-HM improved: residual fusion, confidence gate, epoch stats, best-by-CLIP, ablation
+│   ├── SARHMPP_README.md             # SAR-HM++: modules, batch keys, losses, commands
+│   ├── SARHMPP_IMPLEMENTATION_STATUS.md  # Implementation status + remaining notes
+│   ├── SARHMPP_COMMANDS.md            # Example commands (run_mode, ablations, build scripts)
+│   ├── SARHMPP_TENSOR_AND_SAVE_FORMATS.md # Tensor shapes and file formats
 │   ├── explain.md                     # narrative explanations / debugging notes
 │   └── architecture_diagram.png       # (recommended) architecture figure used in README
 │
@@ -378,7 +487,7 @@ High-level structure (key files only):
 │   └── sarhm/                         # optional; created/used when SAR-HM enabled
 │       └── prototypes_dummy.pt        # dummy prototypes (if none provided)
 │
-├── results/                           # generated outputs (training, eval, compare-eval)
+├── results/                           # generated outputs (training, eval, compare-eval, benchmark)
 │   ├── runs/
 │   │   └── <timestamp>_<mode>_<seed>/
 │   │       ├── config.json
@@ -388,6 +497,9 @@ High-level structure (key files only):
 │   │       ├── checkpoint_best.pth
 │   │       ├── prototypes.pt          # SAR-HM only
 │   │       └── lightning_logs/...
+│   ├── benchmark_outputs/             # unified benchmark: ground_truth.png, thoughtviz.png, dreamdiffusion.png, sarhm.png
+│   │   └── <dataset>/sample_<id>/
+│   ├── experiments/                  # optional: run_001/, run_002/ (config, metrics, timing, tables)
 │   ├── eval/
 │   │   └── <timestamp>/...
 │   └── compare_eval_thesis/
@@ -427,6 +539,8 @@ Optional: ImageNet subset (for ImageNet-EEG) provided via Drive:
 
 > If you cannot access Drive from your environment, download locally and upload/mount into your compute instance.
 
+**Unified benchmark — ThoughtViz:** Place the official ThoughtViz repository under `code/ThoughtViz/` (or `codes/ThoughtViz/`). The benchmark uses its `data.pkl`, image folders, and model checkpoints; see `docs/thoughtviz_integration.md`.
+
 ### Stable Diffusion 1.5
 
 Download SD 1.5 weights and config and place them under:
@@ -460,27 +574,25 @@ To reproduce the reported thesis results:
 
 ---
 
-## Switching Modes (Baseline vs SAR-HM)
+## Switching Modes (Baseline vs SAR-HM vs SAR-HM++)
 
 ### Baseline DreamDiffusion
 
-- In `code/config.py`: `use_sarhm = False`
-- Training and generation use:  
-  EEG → MAE → channel/latent mapper → Stable Diffusion conditioning
+- `--run_mode baseline` or `use_sarhm=False`, `use_sarhmpp=False`
+- Conditioning: EEG → MAE → channel/latent mapper → Stable Diffusion
 
 ### SAR-HM
 
-- In `code/config.py`: `use_sarhm = True`
-- Choose SAR-HM ablation mode (`Config_Generative_Model.ablation_mode`):
-  - `projection_only` – EEG → projection → adapter → SD
-  - `hopfield_no_gate` – add Hopfield retrieval, no gating
-  - `full_sarhm` – Hopfield + confidence-gated fusion (recommended)
+- `--run_mode sarhm` or `use_sarhm=True`, `use_sarhmpp=False`
+- Ablation: `--ablation_mode projection_only|hopfield_no_gate|full_sarhm`
+- Conditioning: EEG → MAE → projection → Hopfield(prototypes) → fusion → adapter → SD
 
-**Important:** Ensure you pass the same config into both:
-- `eLDM(..., main_config=config)` for training
-- `eLDM_eval(..., main_config=config)` for evaluation
+### SAR-HM++
 
-> The Stable Diffusion stack (UNet, VAE, text encoder) is **not** fine-tuned; only EEG encoder + SAR-HM modules are trained when enabled.
+- `--run_mode sarhmpp` and `--semantic_prototypes_path` (required). Optional `--semantic_targets_path` for **semantic teacher supervision** in training (wrapper adds z_sem_gt, clip_img_embed_gt, summary_embed_gt to the batch; L_sem_align, L_retr, L_clip_img, L_clip_text are then active).
+- Conditioning: EEG → MAE → baseline c_base; pooled EEG → SemanticQueryHead → q_sem → top-k retrieval → m_sem → SemanticAdapter → c_sem; c_final = c_base + α*(c_sem - c_base). **Inference is EEG-only** (no GT semantics at test time).
+
+**Important:** Use the same config for training and evaluation; for SAR-HM++ evaluation, `semantic_prototypes.pt` is auto-resolved from the checkpoint directory when not provided.
 
 ---
 

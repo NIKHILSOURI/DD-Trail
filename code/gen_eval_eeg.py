@@ -12,6 +12,9 @@ Minimal Stage C (20 images):
 Load real prototypes (required for SAR-HM; use run's prototypes.pt, not baseline_centroids):
   python code/gen_eval_eeg.py ... --proto_path exps/results/generation/28-02-2026-21-42-16/prototypes.pt
 
+SAR-HM++: When config.use_sarhmpp is True (from checkpoint), semantic_prototypes_path is set from
+  --proto_path or from the checkpoint directory (semantic_prototypes.pt or prototypes.pt).
+
 Or use latest run: --latest_run_dir exps/results/generation → copies to exps/latest/ and uses that.
 
 Ablations: --ablation baseline | projection_only | hopfield_no_gate | full
@@ -383,6 +386,21 @@ if __name__ == '__main__':
     if getattr(args, 'ddim_steps', None) is not None:
         config.ddim_steps = args.ddim_steps
         print('[MINI_EVAL] ddim_steps overridden to %d' % args.ddim_steps)
+    # SAR-HM++: set semantic_prototypes_path so eLDM_eval loads the semantic memory
+    if getattr(config, 'use_sarhmpp', False):
+        if getattr(args, 'proto_path', None) and os.path.isfile(args.proto_path):
+            config.semantic_prototypes_path = args.proto_path
+            print('[SAR-HM++] semantic_prototypes_path=%s' % args.proto_path)
+        else:
+            model_dir = os.path.dirname(os.path.abspath(args.model_path))
+            for name in ('semantic_prototypes.pt', 'prototypes.pt'):
+                candidate = os.path.join(model_dir, name)
+                if os.path.isfile(candidate):
+                    config.semantic_prototypes_path = candidate
+                    print('[SAR-HM++] semantic_prototypes_path from checkpoint dir: %s' % candidate)
+                    break
+        if getattr(config, 'semantic_prototypes_path', None) is None:
+            print('[SAR-HM++] WARNING: no semantic_prototypes.pt found; pass --proto_path or place file in checkpoint dir. Inference will fall back to baseline (alpha=0).')
 
     output_path = os.path.join(config.root_path, 'results', 'eval',
                     '%s'%(datetime.datetime.now().strftime("%d-%m-%Y-%H-%M-%S")))

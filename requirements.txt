@@ -30,6 +30,8 @@ kornia>=0.7.0,<1.0.0
 
 # Transformers and CLIP
 transformers>=4.30.0,<5.0.0
+accelerate>=0.30.0,<1.0.0
+sentence-transformers>=2.2.2,<4.0.0
 
 # Config and utilities
 omegaconf>=2.3.0,<3.0.0

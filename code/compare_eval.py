@@ -1,5 +1,5 @@
 """
-Dual evaluation: BASELINE vs SAR-HM on the same dataset/seed/samples.
+Dual evaluation: BASELINE vs SAR-HM (or SAR-HM++) on the same dataset/seed/samples.
 Generates exactly N test images per mode, saves comparison grids and metrics.
 
 Ready-to-run (from repo root, with code on PYTHONPATH):
@@ -10,6 +10,10 @@ Ready-to-run (from repo root, with code on PYTHONPATH):
     --sarhm_ckpt exps/results/generation/<sarhm_run>/checkpoint.pth \\
     --sarhm_proto exps/results/generation/<sarhm_run>/prototypes.pt \\
     --n_samples 20 --ddim_steps 250 --seed 2022 --out_dir results/compare_eval
+
+SAR-HM++: You can pass a SAR-HM++ checkpoint as --sarhm_ckpt. semantic_prototypes.pt is then
+  loaded from the checkpoint directory automatically (see utils_eval.load_model). --sarhm_proto
+  is ignored for SAR-HM++ (class prototypes); use the same run dir that contains semantic_prototypes.pt.
 """
 from __future__ import annotations
 
@@ -66,7 +70,8 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--config_patch", type=str, default="pretrains/models/config15.yaml")
     p.add_argument("--baseline_ckpt", type=str, required=True)
     p.add_argument("--sarhm_ckpt", type=str, required=True)
-    p.add_argument("--sarhm_proto", type=str, default=None)
+    p.add_argument("--sarhm_proto", type=str, default=None, help="Class prototypes for SAR-HM (ignored for SAR-HM++).")
+    p.add_argument("--sarhmpp_proto", type=str, default=None, help="semantic_prototypes.pt for SAR-HM++ (overrides auto-detect from ckpt dir).")
     p.add_argument("--n_samples", type=int, default=20)
     p.add_argument("--ddim_steps", type=int, default=250)
     p.add_argument("--seed", type=int, default=2022)
@@ -177,6 +182,11 @@ def main() -> None:
     _log("SARHM", "scale_factor=%s" % sf2_val)
 
     csm = getattr(model_sarhm.model, "cond_stage_model", None)
+    # SAR-HM++: optionally override semantic prototypes path (else use path set in load_model from ckpt dir)
+    if csm is not None and getattr(csm, "use_sarhmpp", False) and getattr(args, "sarhmpp_proto", None) and os.path.isfile(args.sarhmpp_proto):
+        bank = getattr(csm, "semantic_memory_bank", None)
+        if bank is not None and hasattr(bank, "load_from_path") and bank.load_from_path(args.sarhmpp_proto):
+            _log("SARHMPP", "loaded semantic_prototypes from %s" % args.sarhmpp_proto)
     if csm is not None and getattr(csm, "use_sarhm", False):
         if args.sarhm_proto and os.path.isfile(args.sarhm_proto):
             if getattr(csm, "sarhm_prototypes", None) is not None:

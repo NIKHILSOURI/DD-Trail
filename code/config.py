@@ -180,6 +180,9 @@ class Config_Generative_Model:
         self.eval_every = 2
         self.num_eval_samples = 50
 
+        # ---------- Run mode (overrides use_sarhm/use_sarhmpp when set) ----------
+        self.run_mode = None  # None | 'baseline' | 'sarhm' | 'sarhmpp'
+
         # ---------- SAR-HM (Semantic Associative Retrieval with Hopfield Memory) ----------
         self.use_sarhm = True
         self.proto_mode = 'class'
@@ -218,6 +221,103 @@ class Config_Generative_Model:
         self.stable_loss_epochs = 5
         self.lambda_retrieval = 0.1
 
+        # ---------- SAR-HM improved (optional; backward compatible) ----------
+        # A. Residual fusion: final_cond = baseline_cond + alpha * (sarhm_cond - baseline_cond)
+        self.use_residual_fusion = True  # False = original (legacy) fusion behavior for ablation
+        self.sarhm_fusion_mode = 'residual'  # 'residual' | 'original' (original = replace with c_sar when not residual)
+        self.sarhm_alpha = 0.2  # Optional fixed alpha when use_residual_fusion; None = use confidence-based alpha
+        self.sarhm_residual_clamp = None  # Optional clamp on residual (e.g. 2.0); None = no clamp
+        self.residual_scale = 1.0  # Scale factor on (c_sar - c_base) before adding
+        self.residual_clamp_value = None  # Clamp residual magnitude; None = no clamp
+        # B. Confidence-gated fusion: alpha * g * (sarhm_cond - baseline_cond)
+        self.use_confidence_gate = True  # When True, alpha is modulated by retrieval confidence
+        self.confidence_source = 'entropy'  # 'max' | 'entropy' | 'margin' (top1 - top2 similarity)
+        self.confidence_min = 0.0
+        self.confidence_max = 1.0
+        # C. Warm-start / safe training (warm_start_from_baseline above inits adapter near zero)
+        self.freeze_sarhm_until_epoch = 0  # Freeze SAR-HM params (projection, hopfield, adapter) until this epoch; 0 = never
+        self.progressive_unfreeze = False  # Unfreeze SAR-HM progressively (e.g. projection first, then hopfield)
+        # D. Epoch stats and best checkpoint
+        self.save_epoch_stats = True  # Save train/val stats to CSV every epoch
+        self.save_every_epoch_ckpt = False  # Save checkpoint every epoch (epoch_XXX.ckpt)
+        self.save_best_by_clip = True  # Save best_clip.ckpt when val CLIP is computed
+        self.save_best_by_balanced_score = False  # Save best_balanced.ckpt
+        self.balanced_score_weights = (0.5, 0.25, 0.25)  # (w_clip, w_ssim, w_pcc) for balanced score
+        # E. Early stopping
+        self.early_stopping_monitor = None  # None | 'val_loss' | 'clip_sim_mean' | 'balanced_score'
+        self.early_stopping_patience = 5
+        self.early_stopping_min_delta = 1e-4
+        # F. Reduce semantic drift (alpha schedule, freeze SAR-HM later)
+        self.alpha_schedule_type = 'warmup'  # 'warmup' | 'constant' | 'decay_after'
+        self.alpha_start = 0.05
+        self.alpha_end = 0.2
+        self.alpha_decay_start_epoch = None  # When set, decay alpha after this epoch (e.g. 0.8 * alpha_end)
+        self.freeze_sarhm_after_epoch = None  # Freeze SAR-HM after this epoch; None = never
+        self.sarhm_lr_multiplier = 1.0  # LR multiplier for SAR-HM params only (e.g. 0.5 for gentler updates)
+        # G. Prototype / memory quality (SAR-HM only; no semantic classes)
+        self.normalize_memory_embeddings = True  # L2-normalize prototype vectors when loading
+        self.top_k_retrieval = None  # None = use all K; int = use only top-k by similarity
+        self.min_retrieval_confidence = 0.0  # Downweight or zero alpha when confidence below this
+        self.use_similarity_margin = False  # Use (top1 - top2) as confidence proxy when confidence_source=='margin'
+        self.retrieval_temperature = 1.0  # Same as hopfield_tau; softmax temperature for attention
+        # H. Limit retrieval strength
+        self.attention_temperature = 1.0  # Softmax temperature in Hopfield (same as hopfield_tau if not set)
+        # I. Loss weights (modular; for high-CLIP-priority set lambda_clip_* higher)
+        self.lambda_diffusion = 1.0  # Main diffusion noise prediction loss
+        self.lambda_recon = 0.0  # Optional reconstruction term (if any)
+        self.lambda_clip = 0.2  # CLIP loss (EEG->cond vs image embed); increase for higher CLIP priority
+        self.lambda_pcc = 0.0
+        self.lambda_ssim = 0.0
+        # J/K. Inference-time controls (used by eval scripts when loading config)
+        self.eval_ddim_steps = None  # None = use ddim_steps from config
+        self.eval_guidance_scale = 1.0
+        self.eval_retrieval_top_k = None
+        self.eval_fusion_alpha = None
+        self.eval_confidence_gate = True
+        # L. Reproducibility
+        self.save_full_config = True  # Save full config with checkpoint and in run dir
+        self.save_git_hash = True  # Save git commit hash in run dir when available
+
+        # ---------- SAR-HM++ (Multi-Level Semantic Prototype Retrieval) ----------
+        self.use_sarhmpp = False
+        self.semantic_targets_path = None
+        self.semantic_prototypes_path = None
+        self.semantic_memory_mode = 'per_sample'
+        self.semantic_fusion_mode = 'concat_project'
+        self.semantic_target_fusion_mode = 'concat_project'
+        self.semantic_query_pooling = 'mean'
+        self.semantic_query_dim = 768
+        self.semantic_topk = 5
+        self.semantic_temperature = 1.0
+        self.semantic_adapter_mode = 'mlp_tokens_plus_transformer'
+        self.semantic_transformer_layers = 1
+        self.conf_w1 = 0.5
+        self.conf_w2 = 0.3
+        self.conf_w3 = 0.2
+        self.lambda_clip_img = 0.2
+        self.lambda_clip_text = 0.1
+        self.lambda_sem = 0.1
+        self.lambda_retr = 0.1
+        self.lambda_ssim = 0.05
+        self.lambda_obj = 0.0
+        self.clip_loss_every_n_steps = 1
+        self.use_region_semantics = False
+        self.use_summary_semantics = True
+        self.use_scene_semantics = True
+        self.use_object_semantics = True
+        self.training_stage_mode = 'joint'
+        self.freeze_prototypes = True
+        self.prototype_update_after_epoch = 0
+        self.enable_semantic_logging = True
+        # Ablation flags (SAR-HM++ and build scripts): when True, disable that component
+        self.no_summary = False
+        self.no_region = False
+        self.no_scene = False
+        self.no_object = False
+        self.no_clip_loss = False
+        self.no_retrieval_loss = False
+        self.no_confidence_gate = False
+        self.sarhmpp_projection_only = False  # SAR-HM++: use q_sem only (adapter from query), no retrieval
 
 
 class Config_Cls_Model:

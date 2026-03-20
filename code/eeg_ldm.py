@@ -106,6 +106,150 @@ class ExperimentLoggingCallback(pl.Callback):
             csm.alpha_max = float(start)
 
 
+class EpochStatsAndBestCheckpointCallback(pl.Callback):
+    """
+    Saves epoch-wise train/val stats to CSV and optional best-by-CLIP / best-by-balanced checkpoints.
+    SAR-HM improved: save_epoch_stats, save_best_by_clip, save_best_by_balanced_score.
+    """
+    def __init__(self, config, output_path, generative_model=None):
+        self.config = config
+        self.output_path = output_path
+        self.generative_model = generative_model
+        self.save_epoch_stats = getattr(config, "save_epoch_stats", True)
+        self.save_best_by_clip = getattr(config, "save_best_by_clip", False)
+        self.save_best_by_balanced = getattr(config, "save_best_by_balanced_score", False)
+        self.balanced_weights = getattr(config, "balanced_score_weights", (0.5, 0.25, 0.25))
+        self._best_clip = -float("inf")
+        self._best_balanced = -float("inf")
+        self._best_clip_epoch = -1
+        self._best_balanced_epoch = -1
+        self._epoch_stats_path = os.path.join(output_path, "epoch_stats.csv")
+        self._best_summary_path = os.path.join(output_path, "best_epoch_summary.txt")
+
+    def _write_epoch_row(self, row_dict):
+        import csv
+        os.makedirs(self.output_path, exist_ok=True)
+        file_exists = os.path.isfile(self._epoch_stats_path)
+        with open(self._epoch_stats_path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=sorted(row_dict.keys()), extrasaction="ignore")
+            if not file_exists:
+                w.writeheader()
+            w.writerow(row_dict)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if not self.save_epoch_stats:
+            return
+        epoch = trainer.current_epoch
+        cm = trainer.callback_metrics or {}
+        row = {"epoch": epoch}
+        for k, v in cm.items():
+            if isinstance(v, torch.Tensor) and v.numel() == 1:
+                try:
+                    row[k] = float(v.item())
+                except Exception:
+                    pass
+            elif hasattr(v, "item"):
+                try:
+                    row[k] = float(v.item())
+                except Exception:
+                    pass
+        self._write_epoch_row(row)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        samples = getattr(pl_module, "_last_val_samples", None)
+        if samples is None or len(samples) == 0:
+            return
+        epoch = getattr(pl_module, "_last_val_epoch", trainer.current_epoch)
+        try:
+            gt_list = [np.asarray(s[0]) for s in samples if len(s) >= 1]
+            gen_list = [np.asarray(s[1]) for s in samples if len(s) >= 2]
+            if not gt_list or not gen_list or len(gt_list) != len(gen_list):
+                return
+            from utils_eval import compute_metrics
+            dev = next(pl_module.parameters()).device
+            metrics = compute_metrics(gen_list, gt_list, device=dev)
+        except Exception as e:
+            print("[EpochStats] compute_metrics failed: %s" % e)
+            return
+        row = {"epoch": epoch, "val_epoch": epoch}
+        for k, v in metrics.items():
+            row["val_" + k] = v
+        if self.save_epoch_stats:
+            self._write_epoch_row(row)
+        # Log so EarlyStopping can monitor val/clip_sim_mean or val/balanced_score
+        clip_sim = metrics.get("clip_sim_mean")
+        if isinstance(clip_sim, (int, float)):
+            pl_module.log("val/clip_sim_mean", float(clip_sim), on_step=False, on_epoch=True)
+        ssim_mean = metrics.get("ssim_mean")
+        pcc_mean = metrics.get("pcc_mean")
+        if isinstance(ssim_mean, (int, float)) and isinstance(pcc_mean, (int, float)):
+            wc, ws, wp = self.balanced_weights
+            b = wc * float(clip_sim if isinstance(clip_sim, (int, float)) else 0) + ws * float(ssim_mean) + wp * (float(pcc_mean) + 1) / 2.0
+            pl_module.log("val/balanced_score", b, on_step=False, on_epoch=True)
+        ssim_mean = metrics.get("ssim_mean")
+        pcc_mean = metrics.get("pcc_mean")
+        if clip_sim != "NA" and isinstance(clip_sim, (int, float)) and self.save_best_by_clip and clip_sim > self._best_clip:
+            self._best_clip = clip_sim
+            self._best_clip_epoch = epoch
+            ckpt = {
+                "model_state_dict": pl_module.state_dict(),
+                "config": getattr(pl_module, "main_config", self.config),
+                "epoch": epoch,
+                "clip_sim_mean": clip_sim,
+            }
+            path = os.path.join(self.output_path, "best_clip.pth")
+            torch.save(ckpt, path)
+            print("[EpochStats] Saved best_clip.pth (epoch=%d clip_sim=%.4f)" % (epoch, clip_sim))
+        if self.save_best_by_balanced and ssim_mean != "NA" and pcc_mean != "NA" and clip_sim != "NA":
+            try:
+                wc, ws, wp = self.balanced_weights
+                b = wc * float(clip_sim) + ws * float(ssim_mean) + wp * (float(pcc_mean) + 1) / 2.0
+                if b > self._best_balanced:
+                    self._best_balanced = b
+                    self._best_balanced_epoch = epoch
+                    ckpt = {
+                        "model_state_dict": pl_module.state_dict(),
+                        "config": getattr(pl_module, "main_config", self.config),
+                        "epoch": epoch,
+                        "balanced_score": b,
+                        "clip_sim_mean": float(clip_sim),
+                        "ssim_mean": float(ssim_mean),
+                        "pcc_mean": float(pcc_mean),
+                    }
+                    path = os.path.join(self.output_path, "best_balanced.pth")
+                    torch.save(ckpt, path)
+                    print("[EpochStats] Saved best_balanced.pth (epoch=%d balanced=%.4f)" % (epoch, b))
+            except (TypeError, ValueError):
+                pass
+        with open(self._best_summary_path, "w", encoding="utf-8") as f:
+            f.write("best_clip_epoch=%d clip_sim=%.4f\nbest_balanced_epoch=%d balanced=%.4f\n" % (
+                self._best_clip_epoch, self._best_clip, self._best_balanced_epoch, self._best_balanced))
+
+
+class FreezeSARHMCallback(pl.Callback):
+    """Freeze SAR-HM parameters until freeze_sarhm_until_epoch; then unfreeze. Optional; no-op if freeze_sarhm_until_epoch is 0 or None."""
+    def __init__(self, config):
+        self.config = config
+        self.freeze_until = getattr(config, 'freeze_sarhm_until_epoch', 0) or 0
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        if self.freeze_until <= 0:
+            return
+        csm = getattr(pl_module, 'cond_stage_model', None)
+        if csm is None or not getattr(csm, 'use_sarhm', False):
+            return
+        freeze = trainer.current_epoch < self.freeze_until
+        for name in ('sarhm_projection', 'sarhm_hopfield', 'sarhm_fusion', 'sarhm_adapter', 'sarhm_prototypes'):
+            m = getattr(csm, name, None)
+            if m is not None:
+                for p in m.parameters():
+                    p.requires_grad = not freeze
+        if freeze and trainer.current_epoch == 0:
+            print("[FreezeSARHM] SAR-HM params frozen until epoch %d" % self.freeze_until)
+        elif not freeze and trainer.current_epoch == self.freeze_until:
+            print("[FreezeSARHM] SAR-HM params unfrozen from epoch %d" % trainer.current_epoch)
+
+
 def wandb_init(config, output_path):
     # wandb.init( project='dreamdiffusion',
     #             group="stageB_dc-ldm",
@@ -276,11 +420,15 @@ def fmri_transform(x, sparse_rate=0.2):
 def ensure_prototypes_loaded_or_built(model, config, train_dataset, output_dir, device):
     """
     Build or load baseline_centroids prototypes after dataloader/dataset exists, before first forward.
-    Only runs if config.use_sarhm and config.proto_source == 'baseline_centroids'.
+    Only runs if config.use_sarhm and not use_sarhmpp and config.proto_source == 'baseline_centroids'.
+    SAR-HM++ uses semantic_prototypes_path and loads inside cond_stage_model; skip here.
     Validates shape (K, 768), finite, float32. Raises RuntimeError if invalid after build/load.
     Returns path used.
     """
     if not getattr(config, 'use_sarhm', False):
+        return None
+    # SAR-HM++ uses semantic_prototypes_path loaded inside cond_stage_model; skip class-centroid build here.
+    if getattr(config, 'use_sarhmpp', False):
         return None
     proto_source = getattr(config, 'proto_source', '') or 'baseline_centroids'
     if proto_source != 'baseline_centroids':
@@ -412,6 +560,24 @@ def main(config):
             else:
                 n_val = len(eeg_latents_dataset_test)
             print('[MINI] train_items=%d val_items=%d' % (len(eeg_latents_dataset_train), len(eeg_latents_dataset_test)))
+
+        # SAR-HM++: wrap train dataset with semantic targets when path is set (training-only; no GT in inference)
+        if getattr(config, 'use_sarhmpp', False) and getattr(config, 'semantic_targets_path', None) and os.path.isfile(config.semantic_targets_path):
+            try:
+                from sarhm.semantic_dataset_wrapper import SemanticTargetWrapper
+                eeg_latents_dataset_train = SemanticTargetWrapper(
+                    eeg_latents_dataset_train,
+                    semantic_targets_path=config.semantic_targets_path,
+                    use_semantic_targets=True,
+                    fusion_mode=getattr(config, 'semantic_target_fusion_mode', 'weighted_avg'),
+                    use_summary=not getattr(config, 'no_summary', False),
+                    use_scene=not getattr(config, 'no_scene', False),
+                    use_object=not getattr(config, 'no_object', False),
+                    use_region=getattr(config, 'use_region_semantics', False),
+                )
+                print('[SAR-HM++] Wrapped train dataset with semantic targets from %s' % config.semantic_targets_path)
+            except Exception as e:
+                print('[SAR-HM++] WARNING: Could not wrap train dataset with semantic targets: %s. Training without z_sem_gt.' % e)
 
     else:
         raise NotImplementedError
@@ -551,6 +717,19 @@ def main(config):
     extra_callbacks = []
     if metric_logger is not None and run_dir and ExperimentLoggingCallback is not None:
         extra_callbacks.append(ExperimentLoggingCallback(metric_logger, generative_model, eval_datasets, config))
+    if getattr(config, 'save_epoch_stats', True) or getattr(config, 'save_best_by_clip', False) or getattr(config, 'save_best_by_balanced_score', False):
+        extra_callbacks.append(EpochStatsAndBestCheckpointCallback(config, config.output_path, generative_model))
+    if getattr(config, 'freeze_sarhm_until_epoch', 0) and getattr(config, 'use_sarhm', False):
+        extra_callbacks.append(FreezeSARHMCallback(config))
+    early_monitor = getattr(config, 'early_stopping_monitor', None)
+    if early_monitor:
+        from pytorch_lightning.callbacks import EarlyStopping
+        mode = 'max' if early_monitor in ('clip_sim_mean', 'balanced_score') else 'min'
+        monitor_key = 'val/loss' if early_monitor == 'val_loss' else ('val/' + early_monitor)
+        patience = getattr(config, 'early_stopping_patience', 5)
+        min_delta = getattr(config, 'early_stopping_min_delta', 1e-4)
+        early_cb = EarlyStopping(monitor=monitor_key, mode=mode, patience=patience, min_delta=min_delta, verbose=True)
+        extra_callbacks.append(early_cb)
     check_val = getattr(config, 'check_val_every_n_epoch', 2) or 2
     trainer = create_trainer(config.num_epoch, config.precision, config.accumulate_grad, config.logger, check_val_every_n_epoch=check_val, extra_callbacks=extra_callbacks)
     val_limit = getattr(config, 'val_gen_limit', 2)
@@ -613,7 +792,8 @@ def get_args_parser():
     parser.add_argument('--val_ddim_steps', type=int, default=None, help='DDIM/PLMS steps during validation only (default 50; Stage C uses ddim_steps)')
     parser.add_argument('--val_num_samples', type=int, default=None, help='Samples per item during validation only (default 2; Stage C uses num_samples)')
     parser.add_argument('--test_gen_limit', type=int, default=None, help='Limit test images generated after training (e.g. 5 or 10 for fast; default 10)')
-    parser.add_argument('--use_sarhm', type=str, default=None, choices=['true','false'], help='Enable SAR-HM')
+    parser.add_argument('--run_mode', type=str, default=None, choices=['baseline', 'sarhm', 'sarhmpp'], help='Override: baseline | sarhm | sarhmpp (sets use_sarhm/use_sarhmpp).')
+    parser.add_argument('--use_sarhm', type=str, default=None, choices=['true','false'], help='Enable SAR-HM (ignored if --run_mode set).')
     parser.add_argument('--ablation_mode', type=str, default=None, help='baseline|projection_only|hopfield_no_gate|full_sarhm')
     parser.add_argument('--proto_source', type=str, default=None, help='baseline_centroids|clip_text|learnable')
     parser.add_argument('--normalize_conditioning', type=str, default=None, choices=['true','false'], help='LayerNorm before fusion (true=layernorm)')
@@ -624,9 +804,37 @@ def get_args_parser():
     parser.add_argument('--warm_start_from_baseline', type=str, default=None, choices=['true', 'false'], help='If true, init SAR adapter near zero (weights-only). Default false for fresh SAR-HM.')
     parser.add_argument('--clip_tune', type=str, default=None, choices=['true','false'], help='CLIP loss; false saves VRAM, works without ImageNet')
 
+    # SAR-HM++
+    parser.add_argument('--use_sarhmpp', action='store_true', help='Enable SAR-HM++ (ignored if --run_mode set).')
+    parser.add_argument('--semantic_prototypes_path', type=str, default=None, help='Path to semantic_prototypes.pt for SAR-HM++. Default: datasets/semantic_prototypes.pt')
+    parser.add_argument('--semantic_targets_path', type=str, default=None, help='Path to semantic_targets.pt (for training with z_sem_gt in batch).')
+    parser.add_argument('--semantic_topk', type=int, default=5, help='Top-k for semantic retrieval (default 5).')
+    # Ablation flags
+    parser.add_argument('--no_summary', action='store_true', help='SAR-HM++: disable summary semantics in targets/prototypes.')
+    parser.add_argument('--no_region', action='store_true', help='SAR-HM++: disable region semantics.')
+    parser.add_argument('--no_scene', action='store_true', help='SAR-HM++: disable scene semantics.')
+    parser.add_argument('--no_object', action='store_true', help='SAR-HM++: disable object semantics.')
+    parser.add_argument('--no_clip_loss', action='store_true', help='Disable CLIP image/text loss (lambda_clip_img=0, lambda_clip_text=0).')
+    parser.add_argument('--no_retrieval_loss', action='store_true', help='Disable retrieval consistency loss L_retr (lambda_retr=0).')
+    parser.add_argument('--no_confidence_gate', action='store_true', help='Use constant alpha=alpha_max (no confidence gating).')
+    parser.add_argument('--sarhmpp_projection_only', action='store_true', help='SAR-HM++: use query-only path (q_sem->adapter), no retrieval.')
+
+    # SAR-HM improved (optional)
+    parser.add_argument('--use_residual_fusion', type=str, default=None, choices=['true', 'false'], help='Residual fusion: c_base + alpha*(c_sar - c_base). Default true.')
+    parser.add_argument('--sarhm_alpha', type=float, default=None, help='Fixed fusion alpha (overrides confidence-based alpha when set).')
+    parser.add_argument('--save_epoch_stats', type=str, default=None, choices=['true', 'false'], help='Save epoch_stats.csv every epoch. Default true.')
+    parser.add_argument('--save_best_by_clip', type=str, default=None, choices=['true', 'false'], help='Save best_clip.pth when val CLIP improves. Default from config.')
+    parser.add_argument('--save_best_by_balanced_score', type=str, default=None, choices=['true', 'false'])
+    parser.add_argument('--freeze_sarhm_until_epoch', type=int, default=None, help='Freeze SAR-HM params until this epoch (0=never).')
+    parser.add_argument('--lambda_clip', type=float, default=None, help='Weight for CLIP loss; increase for higher CLIP priority (e.g. 0.5).')
+    parser.add_argument('--early_stopping_monitor', type=str, default=None, choices=['val_loss', 'clip_sim_mean', 'balanced_score'], help='Metric to monitor for early stopping.')
+    parser.add_argument('--early_stopping_patience', type=int, default=None)
+    parser.add_argument('--top_k_retrieval', type=int, default=None, help='Use only top-k keys in Hopfield retrieval (e.g. 4).')
+    parser.add_argument('--normalize_memory_embeddings', type=str, default=None, choices=['true', 'false'])
+
     # Thesis logging and evaluation
     parser.add_argument('--run_name', type=str, default=None, help='Optional run name for runs/<timestamp>_<model>_<seed>/')
-    parser.add_argument('--model', type=str, default=None, choices=['baseline', 'sarhm'], help='Model type for run folder and logging')
+    parser.add_argument('--model', type=str, default=None, choices=['baseline', 'sarhm', 'sarhmpp'], help='Model type for run folder and logging')
     parser.add_argument('--seed', type=int, default=2022, help='Random seed for run folder and reproducibility')
     parser.add_argument('--eval_every', type=int, default=2, help='Run evaluation every N epochs')
     parser.add_argument('--num_eval_samples', type=int, default=50, help='Max samples per dataset for evaluation')
@@ -688,10 +896,66 @@ def update_config(args, config):
         config.normalize_conditioning = (args.normalize_conditioning == 'true')
     if getattr(args, 'warm_start_from_baseline', None) is not None:
         config.warm_start_from_baseline = (args.warm_start_from_baseline == 'true')
+    # SAR-HM improved: CLI bools
+    if getattr(args, 'use_residual_fusion', None) is not None:
+        config.use_residual_fusion = (args.use_residual_fusion == 'true')
+    if getattr(args, 'save_epoch_stats', None) is not None:
+        config.save_epoch_stats = (args.save_epoch_stats == 'true')
+    if getattr(args, 'save_best_by_clip', None) is not None:
+        config.save_best_by_clip = (args.save_best_by_clip == 'true')
+    if getattr(args, 'save_best_by_balanced_score', None) is not None:
+        config.save_best_by_balanced_score = (args.save_best_by_balanced_score == 'true')
+    if getattr(args, 'normalize_memory_embeddings', None) is not None:
+        config.normalize_memory_embeddings = (args.normalize_memory_embeddings == 'true')
     elif getattr(args, 'use_sarhm', False):
         config.warm_start_from_baseline = False  # default false for SAR-HM fresh runs
     if getattr(args, 'init_from_ckpt', None) is not None:
         config.init_from_ckpt = args.init_from_ckpt
+    # run_mode overrides use_sarhm / use_sarhmpp
+    if getattr(args, 'run_mode', None) is not None:
+        rm = args.run_mode.lower()
+        config.run_mode = rm
+        config.use_sarhm = (rm == 'sarhm')
+        config.use_sarhmpp = (rm == 'sarhmpp')
+    # SAR-HM++
+    if getattr(args, 'use_sarhmpp', False) or getattr(config, 'use_sarhmpp', False):
+        config.use_sarhmpp = True
+        # use_sarhm left as-is; cond_stage_model builds SAR-HM++ branch when use_sarhmpp=True
+        if getattr(args, 'semantic_prototypes_path', None) is not None:
+            config.semantic_prototypes_path = args.semantic_prototypes_path
+        elif getattr(config, 'semantic_prototypes_path', None) is None:
+            from pathlib import Path
+            _root = getattr(config, 'root_path', None) or Path(__file__).resolve().parent.parent
+            _data = Path(_root) / 'datasets'
+            config.semantic_prototypes_path = str(_data / 'semantic_prototypes.pt')
+        if getattr(args, 'semantic_targets_path', None) is not None:
+            config.semantic_targets_path = args.semantic_targets_path
+        if getattr(args, 'semantic_topk', None) is not None:
+            config.semantic_topk = args.semantic_topk
+    # Ablation flags
+    if getattr(args, 'no_summary', False):
+        config.no_summary = True
+        config.use_summary_semantics = False
+    if getattr(args, 'no_region', False):
+        config.no_region = True
+        config.use_region_semantics = False
+    if getattr(args, 'no_scene', False):
+        config.no_scene = True
+        config.use_scene_semantics = False
+    if getattr(args, 'no_object', False):
+        config.no_object = True
+        config.use_object_semantics = False
+    if getattr(args, 'no_clip_loss', False):
+        config.no_clip_loss = True
+        config.lambda_clip_img = 0.0
+        config.lambda_clip_text = 0.0
+    if getattr(args, 'no_retrieval_loss', False):
+        config.no_retrieval_loss = True
+        config.lambda_retr = 0.0
+    if getattr(args, 'no_confidence_gate', False):
+        config.no_confidence_gate = True
+    if getattr(args, 'sarhmpp_projection_only', False):
+        config.sarhmpp_projection_only = True
     if hasattr(args, 'skip_post_train_generation') and getattr(args, 'skip_post_train_generation', None) is not None:
         config.skip_post_train_generation = (args.skip_post_train_generation == 'true')
     # When validation image gen is enabled, default to every epoch if not set

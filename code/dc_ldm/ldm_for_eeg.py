@@ -31,6 +31,21 @@ except ImportError as e:
     compute_alpha_from_attention = None
     _SARHM_IMPORT_ERROR = str(e)
 
+# Optional SAR-HM++ (Multi-Level Semantic Prototype Retrieval)
+try:
+    from sarhm.semantic_query import SemanticQueryHead, pool_eeg_for_query
+    from sarhm.semantic_retrieval import SemanticRetrieval, confidence_from_attention
+    from sarhm.semantic_adapter import SemanticAdapter as SemanticAdapterPP
+    from sarhm.semantic_memory import SemanticMemoryBank
+    _SARHMPP_AVAILABLE = True
+except ImportError as e:
+    _SARHMPP_AVAILABLE = False
+    SemanticQueryHead = None
+    SemanticRetrieval = None
+    SemanticAdapterPP = None
+    SemanticMemoryBank = None
+    _SARHMPP_IMPORT_ERROR = str(e)
+
 
 def create_model_from_config(config, num_voxels, global_pool):
     model = eeg_encoder(time_len=num_voxels, patch_size=config.patch_size, embed_dim=config.embed_dim,
@@ -52,9 +67,25 @@ class cond_stage_model(nn.Module):
                  proto_path=None, proto_mode='class',
                  alpha_mode='entropy', alpha_max=0.2, conf_threshold=0.2, alpha_constant=0.1,
                  warm_start_from_baseline=True,
-                 normalize_conditioning=True, normalization_type='layernorm', debug_cond_stats=False):
+                 normalize_conditioning=True, normalization_type='layernorm', debug_cond_stats=False,
+                 use_sarhmpp=False, semantic_prototypes_path=None, semantic_topk=5, semantic_temperature=1.0,
+                 semantic_query_pooling='mean', semantic_adapter_mode='mlp_tokens_plus_transformer',
+                 semantic_transformer_layers=1, conf_w1=0.5, conf_w2=0.3, conf_w3=0.2,
+                 no_confidence_gate=False, sarhmpp_projection_only=False,
+                 # SAR-HM improved (optional; backward compatible)
+                 use_residual_fusion=True, sarhm_fusion_mode='residual', sarhm_alpha=None,
+                 sarhm_residual_clamp=None, residual_scale=1.0, residual_clamp_value=None,
+                 use_confidence_gate=True, confidence_source='entropy', confidence_min=0.0, confidence_max=1.0,
+                 normalize_memory_embeddings=False, top_k_retrieval=None):
         super().__init__()
-        self.use_sarhm = use_sarhm and _SARHM_AVAILABLE
+        self.no_confidence_gate = no_confidence_gate
+        self.sarhmpp_projection_only = sarhmpp_projection_only
+        self.use_sarhmpp = use_sarhmpp and _SARHMPP_AVAILABLE
+        if use_sarhmpp and not _SARHMPP_AVAILABLE:
+            import sys
+            err = getattr(sys.modules[__name__], '_SARHMPP_IMPORT_ERROR', 'unknown')
+            print("[cond_stage_model] WARNING: use_sarhmpp=True but sarhm++ modules failed to import; using baseline/sarhm. Error: %s" % err)
+        self.use_sarhm = use_sarhm and _SARHM_AVAILABLE and not self.use_sarhmpp
         self.ablation_mode = ablation_mode if self.use_sarhm else 'baseline'
         if use_sarhm and not _SARHM_AVAILABLE:
             import sys
@@ -72,6 +103,19 @@ class cond_stage_model(nn.Module):
         self.normalize_conditioning = normalize_conditioning
         self.normalization_type = normalization_type if normalization_type in ('layernorm', 'l2') else 'layernorm'
         self.debug_cond_stats = debug_cond_stats
+        # SAR-HM improved: residual fusion and confidence gating (optional)
+        self.use_residual_fusion = use_residual_fusion
+        self.sarhm_fusion_mode = sarhm_fusion_mode if sarhm_fusion_mode in ('residual', 'original') else 'residual'
+        self.sarhm_alpha_fixed = sarhm_alpha  # None = use confidence-based alpha
+        self.sarhm_residual_clamp = sarhm_residual_clamp
+        self.residual_scale = residual_scale
+        self.residual_clamp_value = residual_clamp_value
+        self.use_confidence_gate = use_confidence_gate and not no_confidence_gate
+        self.confidence_source = confidence_source if confidence_source in ('max', 'entropy', 'margin') else 'entropy'
+        self.confidence_min = confidence_min
+        self.confidence_max = confidence_max
+        self.normalize_memory_embeddings = normalize_memory_embeddings
+        self.top_k_retrieval = top_k_retrieval
         if self.normalize_conditioning and self.normalization_type == 'layernorm':
             self.cond_ln = nn.LayerNorm(768)
         else:
@@ -119,7 +163,7 @@ class cond_stage_model(nn.Module):
             clip_dim = 768
             self.sarhm_projection = SemanticProjection(self.fmri_latent_dim, clip_dim=clip_dim)
             self.sarhm_prototypes = ClassPrototypes(num_classes=num_classes, dim=clip_dim, proto_path=proto_path)
-            self.sarhm_hopfield = HopfieldRetrieval(tau=hopfield_tau)
+            self.sarhm_hopfield = HopfieldRetrieval(tau=hopfield_tau, top_k=top_k_retrieval)
             self.sarhm_fusion = ConfidenceGatedFusion(gate_mode=gate_mode)
             self.sarhm_adapter = ConditioningAdapter(clip_dim=clip_dim, cond_dim=cond_dim, seq_len=77)
             if self.warm_start_from_baseline:
@@ -129,6 +173,43 @@ class cond_stage_model(nn.Module):
                 if self.sarhm_prototypes.load_from_path(proto_path):
                     self._proto_source = "loaded"
             # else: train-built prototypes use "train" when set by training script
+
+        # SAR-HM++: multi-level semantic prototype retrieval
+        if self.use_sarhmpp and SemanticQueryHead is not None and SemanticRetrieval is not None and SemanticAdapterPP is not None and SemanticMemoryBank is not None:
+            self.semantic_query_head = SemanticQueryHead(
+                self.fmri_latent_dim,
+                output_dim=768,
+                hidden_dim=512,
+                dropout=0.1,
+            )
+            # Load or create semantic memory bank
+            keys_tensor = None
+            if semantic_prototypes_path and os.path.isfile(semantic_prototypes_path):
+                state = torch.load(semantic_prototypes_path, map_location='cpu', weights_only=False)
+                keys_tensor = state.get('keys', state.get('prototypes'))
+                if keys_tensor is not None:
+                    keys_tensor = torch.as_tensor(keys_tensor, dtype=torch.float32)
+            if keys_tensor is not None:
+                self.semantic_memory_bank = SemanticMemoryBank(keys=keys_tensor, dim=768)
+                self._sarhmpp_proto_loaded = True
+            else:
+                self.semantic_memory_bank = SemanticMemoryBank(num_prototypes=0, dim=768)
+                self._sarhmpp_proto_loaded = False
+            self.semantic_retrieval = SemanticRetrieval(
+                top_k=semantic_topk,
+                temperature=semantic_temperature,
+                conf_w1=conf_w1, conf_w2=conf_w2, conf_w3=conf_w3,
+            )
+            self.semantic_adapter_pp = SemanticAdapterPP(
+                input_dim=768, cond_dim=cond_dim, seq_len=77,
+                mode=semantic_adapter_mode,
+                num_transformer_layers=semantic_transformer_layers,
+            )
+            if warm_start_from_baseline:
+                self.semantic_adapter_pp.init_near_zero_delta(scale=0.01)
+            self._sarhmpp_header_printed = False
+        else:
+            self._sarhmpp_header_printed = False
 
         # self.image_embedder = FrozenImageEmbedder()
 
@@ -204,6 +285,55 @@ class cond_stage_model(nn.Module):
         target_seq = 77
         c_base = self._align_to_seq_len(c_base, target_seq)
 
+        # SAR-HM++ path: semantic query -> top-k retrieval -> adapter -> residual fusion
+        if self.use_sarhmpp and getattr(self, 'semantic_memory_bank', None) is not None:
+            if self.semantic_memory_bank.num_prototypes == 0 or not getattr(self, '_sarhmpp_proto_loaded', False):
+                if not getattr(self, '_sarhmpp_header_printed', False):
+                    self._sarhmpp_header_printed = True
+                    print("[SAR-HM++] No valid semantic prototypes; alpha=0 (baseline only).")
+                self._sarhm_extra = {'c_base': c_base, 'alpha': None, 'q_sem': None, 'm_sem': None}
+                return c_base, latent_return
+            if not getattr(self, '_sarhmpp_header_printed', False):
+                self._sarhmpp_header_printed = True
+                print("SAR-HM++ ACTIVE | top_k=%s | semantic adapter | confidence-gated fusion" % getattr(self.semantic_retrieval, 'top_k', 5))
+            self._last_mae_latent = latent_crossattn
+            # Pool MAE tokens to [B, embed_dim] for semantic query (same pooling as SAR-HM for consistency)
+            pooled = pool_eeg_tokens(latent_crossattn, self.global_pool)
+            q_sem = self.semantic_query_head(pooled)
+            if getattr(self, 'sarhmpp_projection_only', False):
+                m_sem = q_sem
+                attn = None
+                conf = torch.ones(q_sem.shape[0], device=q_sem.device, dtype=q_sem.dtype)
+                topk_idx = None
+            else:
+                m_sem, attn, conf, topk_idx = self.semantic_retrieval(q_sem, self.semantic_memory_bank.keys)
+            c_sem = self.semantic_adapter_pp(m_sem)
+            effective_alpha_max = getattr(self, '_effective_alpha_max', self.alpha_max)
+            if getattr(self, 'no_confidence_gate', False):
+                alpha = torch.full((c_sem.shape[0],), effective_alpha_max, device=c_sem.device, dtype=c_sem.dtype)
+            else:
+                alpha = (effective_alpha_max * conf).clamp(0, effective_alpha_max)
+                alpha = alpha.clone()
+                alpha[conf < self.conf_threshold] = 0.0
+            if self.normalize_conditioning:
+                if self.cond_ln is not None:
+                    c_base_n = self.cond_ln(c_base)
+                    c_sem_n = self.cond_ln(c_sem)
+                else:
+                    eps = 1e-12
+                    c_base_n = F.normalize(c_base, dim=-1, eps=eps)
+                    c_sem_n = F.normalize(c_sem, dim=-1, eps=eps)
+            else:
+                c_base_n = c_base
+                c_sem_n = c_sem
+            alpha_bc = alpha.view(-1, 1, 1).to(c_base_n.dtype)
+            c_final = c_base_n + alpha_bc * (c_sem_n - c_base_n)
+            self._sarhm_extra = {
+                'q_sem': q_sem, 'm_sem': m_sem, 'attn': attn, 'confidence': conf,
+                'alpha': alpha, 'c_base': c_base, 'c_sem': c_sem, 'topk_idx': topk_idx,
+            }
+            return c_final, q_sem
+
         if self.use_sarhm:
             # Ablation: force baseline-only path (no SAR-HM fusion)
             if getattr(self, "_no_sarhm", False):
@@ -241,7 +371,12 @@ class cond_stage_model(nn.Module):
                 attn = None
                 confidence = torch.zeros(z_orig.shape[0], device=z_orig.device, dtype=z_orig.dtype)
             else:
-                z_ret, attn, logits = self.sarhm_hopfield(z_orig, self.sarhm_prototypes)
+                # Optional: normalize prototype vectors before retrieval (improves memory quality)
+                memory = self.sarhm_prototypes.P
+                if getattr(self, 'normalize_memory_embeddings', False):
+                    memory = F.normalize(memory.float(), dim=-1, eps=1e-12).to(memory.dtype)
+                top_k = getattr(self, 'top_k_retrieval', None)
+                z_ret, attn, logits = self.sarhm_hopfield(z_orig, memory, top_k=top_k)
                 if self.ablation_mode == 'hopfield_no_gate':
                     z_fused = z_ret
                     confidence = torch.ones(z_orig.shape[0], device=z_orig.device, dtype=z_orig.dtype) * 0.05
@@ -263,6 +398,13 @@ class cond_stage_model(nn.Module):
                 alpha = torch.full((c_sar.shape[0],), self.alpha_constant, device=c_sar.device, dtype=c_sar.dtype)
                 conf_out = confidence
                 entropy = torch.zeros(c_sar.shape[0], device=c_sar.device, dtype=c_sar.dtype)
+            # Optional: confidence from similarity margin (top1 - top2) when confidence_source == 'margin'
+            if getattr(self, 'confidence_source', 'entropy') == 'margin' and logits is not None and logits.shape[-1] >= 2:
+                top1_sim = logits.max(dim=-1).values
+                top2_sim = logits.topk(2, dim=-1).values[:, 1]
+                margin = (top1_sim - top2_sim).clamp(min=0).float()
+                m_max = margin.max().clamp(min=1e-8)
+                conf_out = (margin / m_max).clamp(0, 1).to(conf_out.dtype)
 
             if self.ablation_mode == 'hopfield_no_gate':
                 alpha = torch.full((c_sar.shape[0],), 0.05, device=c_sar.device, dtype=c_sar.dtype)
@@ -277,6 +419,16 @@ class cond_stage_model(nn.Module):
             if getattr(self, "_force_alpha", None) is not None:
                 alpha = torch.full((alpha.shape[0],), float(self._force_alpha), device=alpha.device, dtype=alpha.dtype)
 
+            # SAR-HM improved: confidence gating — clamp confidence and optionally modulate alpha
+            conf_out_clamped = conf_out.clamp(
+                getattr(self, 'confidence_min', 0.0),
+                getattr(self, 'confidence_max', 1.0)
+            )
+            if getattr(self, 'use_confidence_gate', True) and conf_out_clamped is not None:
+                alpha = alpha * conf_out_clamped
+            if getattr(self, 'sarhm_alpha_fixed', None) is not None:
+                alpha = torch.full((alpha.shape[0],), float(self.sarhm_alpha_fixed), device=alpha.device, dtype=alpha.dtype)
+
             # Normalize c_base and c_sar before fusion (match scales; reduces distribution mismatch)
             if self.normalize_conditioning:
                 if self.cond_ln is not None:
@@ -290,9 +442,27 @@ class cond_stage_model(nn.Module):
                 c_base_n = c_base
                 c_sar_n = c_sar
 
-            # Baseline residual fusion anchored on c_base: c_final = c_base_n + alpha*(c_sar_n - c_base_n)
-            alpha_bc = alpha.view(-1, 1, 1).to(c_base_n.dtype)
-            c_final = c_base_n + alpha_bc * (c_sar_n - c_base_n)
+            # SAR-HM improved: residual fusion or original (replace). final_cond = baseline + alpha * (sarhm - baseline)
+            use_residual = getattr(self, 'use_residual_fusion', True)
+            if use_residual:
+                residual = (c_sar_n - c_base_n).float()
+                scale = getattr(self, 'residual_scale', 1.0)
+                if scale != 1.0:
+                    residual = residual * scale
+                if getattr(self, 'sarhm_residual_clamp', None) is not None:
+                    residual = residual.clamp(-float(self.sarhm_residual_clamp), float(self.sarhm_residual_clamp))
+                if getattr(self, 'residual_clamp_value', None) is not None:
+                    rnorm = residual.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    residual = residual * (rnorm.clamp(max=float(self.residual_clamp_value)) / rnorm)
+                alpha_bc = alpha.view(-1, 1, 1).to(c_base_n.dtype)
+                c_final = c_base_n + alpha_bc * residual.to(c_base_n.dtype)
+            else:
+                # Original (replace): c_final = c_sar when not residual; optional blend still via alpha
+                if getattr(self, 'sarhm_fusion_mode', 'residual') == 'original':
+                    c_final = c_sar_n
+                else:
+                    alpha_bc = alpha.view(-1, 1, 1).to(c_base_n.dtype)
+                    c_final = c_base_n + alpha_bc * (c_sar_n - c_base_n)
 
             if self.debug_cond_stats:
                 def _stats(t, name):
@@ -312,6 +482,7 @@ class cond_stage_model(nn.Module):
 
             self._sarhm_extra = {
                 'confidence': conf_out,
+                'confidence_clamped': conf_out_clamped,
                 'attn': attn,
                 'alpha': alpha,
                 'entropy': entropy if attn is not None else torch.zeros_like(conf_out),
@@ -401,6 +572,31 @@ class eLDM:
                 'normalize_conditioning': getattr(main_config, 'normalize_conditioning', True),
                 'normalization_type': getattr(main_config, 'normalization_type', 'layernorm'),
                 'debug_cond_stats': getattr(main_config, 'debug_cond_stats', False),
+                'use_sarhmpp': getattr(main_config, 'use_sarhmpp', False),
+                'semantic_prototypes_path': getattr(main_config, 'semantic_prototypes_path', None),
+                'semantic_topk': getattr(main_config, 'semantic_topk', 5),
+                'semantic_temperature': getattr(main_config, 'semantic_temperature', 1.0),
+                'semantic_query_pooling': getattr(main_config, 'semantic_query_pooling', 'mean'),
+                'semantic_adapter_mode': getattr(main_config, 'semantic_adapter_mode', 'mlp_tokens_plus_transformer'),
+                'semantic_transformer_layers': getattr(main_config, 'semantic_transformer_layers', 1),
+                'conf_w1': getattr(main_config, 'conf_w1', 0.5),
+                'conf_w2': getattr(main_config, 'conf_w2', 0.3),
+                'conf_w3': getattr(main_config, 'conf_w3', 0.2),
+                'no_confidence_gate': getattr(main_config, 'no_confidence_gate', False),
+                'sarhmpp_projection_only': getattr(main_config, 'sarhmpp_projection_only', False),
+                # SAR-HM improved
+                'use_residual_fusion': getattr(main_config, 'use_residual_fusion', True),
+                'sarhm_fusion_mode': getattr(main_config, 'sarhm_fusion_mode', 'residual'),
+                'sarhm_alpha': getattr(main_config, 'sarhm_alpha', None),
+                'sarhm_residual_clamp': getattr(main_config, 'sarhm_residual_clamp', None),
+                'residual_scale': getattr(main_config, 'residual_scale', 1.0),
+                'residual_clamp_value': getattr(main_config, 'residual_clamp_value', None),
+                'use_confidence_gate': getattr(main_config, 'use_confidence_gate', True),
+                'confidence_source': getattr(main_config, 'confidence_source', 'entropy'),
+                'confidence_min': getattr(main_config, 'confidence_min', 0.0),
+                'confidence_max': getattr(main_config, 'confidence_max', 1.0),
+                'normalize_memory_embeddings': getattr(main_config, 'normalize_memory_embeddings', False),
+                'top_k_retrieval': getattr(main_config, 'top_k_retrieval', None),
             }
         model.cond_stage_model = cond_stage_model(
             metafile, num_voxels, self.cond_dim, global_pool=global_pool, clip_tune=clip_tune, cls_tune=cls_tune,
@@ -659,6 +855,31 @@ class eLDM_eval:
                 'normalize_conditioning': getattr(main_config, 'normalize_conditioning', True),
                 'normalization_type': getattr(main_config, 'normalization_type', 'layernorm'),
                 'debug_cond_stats': getattr(main_config, 'debug_cond_stats', False),
+                'use_sarhmpp': getattr(main_config, 'use_sarhmpp', False),
+                'semantic_prototypes_path': getattr(main_config, 'semantic_prototypes_path', None),
+                'semantic_topk': getattr(main_config, 'semantic_topk', 5),
+                'semantic_temperature': getattr(main_config, 'semantic_temperature', 1.0),
+                'semantic_query_pooling': getattr(main_config, 'semantic_query_pooling', 'mean'),
+                'semantic_adapter_mode': getattr(main_config, 'semantic_adapter_mode', 'mlp_tokens_plus_transformer'),
+                'semantic_transformer_layers': getattr(main_config, 'semantic_transformer_layers', 1),
+                'conf_w1': getattr(main_config, 'conf_w1', 0.5),
+                'conf_w2': getattr(main_config, 'conf_w2', 0.3),
+                'conf_w3': getattr(main_config, 'conf_w3', 0.2),
+                'no_confidence_gate': getattr(main_config, 'no_confidence_gate', False),
+                'sarhmpp_projection_only': getattr(main_config, 'sarhmpp_projection_only', False),
+                # SAR-HM improved (inference-time)
+                'use_residual_fusion': getattr(main_config, 'use_residual_fusion', True),
+                'sarhm_fusion_mode': getattr(main_config, 'sarhm_fusion_mode', 'residual'),
+                'sarhm_alpha': getattr(main_config, 'eval_fusion_alpha', None) or getattr(main_config, 'sarhm_alpha', None),
+                'sarhm_residual_clamp': getattr(main_config, 'sarhm_residual_clamp', None),
+                'residual_scale': getattr(main_config, 'residual_scale', 1.0),
+                'residual_clamp_value': getattr(main_config, 'residual_clamp_value', None),
+                'use_confidence_gate': getattr(main_config, 'eval_confidence_gate', getattr(main_config, 'use_confidence_gate', True)),
+                'confidence_source': getattr(main_config, 'confidence_source', 'entropy'),
+                'confidence_min': getattr(main_config, 'confidence_min', 0.0),
+                'confidence_max': getattr(main_config, 'confidence_max', 1.0),
+                'normalize_memory_embeddings': getattr(main_config, 'normalize_memory_embeddings', False),
+                'top_k_retrieval': getattr(main_config, 'eval_retrieval_top_k', None) or getattr(main_config, 'top_k_retrieval', None),
             }
         model.cond_stage_model = cond_stage_model(
             None, num_voxels, self.cond_dim, global_pool=global_pool, clip_tune=clip_tune, cls_tune=cls_tune,
