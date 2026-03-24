@@ -47,18 +47,23 @@ class BenchmarkConfig:
     eval_size: int = 256  # Standard size for metric evaluation (e.g. 256x256)
 
     # Optional
+    show_progress: bool = True  # tqdm + stage logs for benchmark CLI
     ddim_steps: int = 250
     num_samples_per_item: int = 1  # Generated samples per EEG sample
     # Mandatory evaluation components
     summary_enabled: bool = True
     segmentation_enabled: bool = True
     strict_eval: bool = False
+    # If True, refuse ThoughtViz load when checkpoint family mismatches dataset.
+    # Keep False for "run all models without skipping" workflows.
+    thoughtviz_strict_checkpoint_match: bool = False
     # Summary/caption models
     florence2_model_id: str = "microsoft/Florence-2-base"
     summary_fallback_model_id: str = "Salesforce/blip-image-captioning-base"
     summary_sentence_model_id: str = "sentence-transformers/all-MiniLM-L6-v2"
     # Segmentation models/checkpoints
     grounding_dino_model_id: str = "IDEA-Research/grounding-dino-base"
+    grounding_dino_fallback_model_id: str = "google/owlv2-base-patch16-ensemble"
     grounding_dino_checkpoint_path: Optional[str] = None
     sam2_model_id: str = "facebook/sam-vit-base"
     sam2_config_path: Optional[str] = None

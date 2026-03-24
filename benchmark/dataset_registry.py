@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from .benchmark_config import BenchmarkConfig
+from .imagenet_eeg_internal import create_EEG_dataset_benchmark
+from .progress_util import tqdm
 from .utils import setup_logger
 
 log = setup_logger(__name__)
@@ -25,11 +27,10 @@ def get_imagenet_eeg_samples(
     config: BenchmarkConfig,
     split: str = "test",
     max_samples: Optional[int] = None,
+    show_progress: bool = True,
 ) -> List[Dict[str, Any]]:
     """Load ImageNet-EEG dataset and return list of unified sample dicts."""
     _ensure_code_on_path()
-    from dataset import create_EEG_dataset
-    from torch.utils.data import Subset
 
     eeg_path = config.imagenet_eeg_eeg_path or str(BENCHMARK_ROOT / "datasets" / "eeg_5_95_std.pth")
     splits_path = config.imagenet_eeg_splits_path or str(BENCHMARK_ROOT / "datasets" / "block_splits_by_image_single.pth")
@@ -38,22 +39,39 @@ def get_imagenet_eeg_samples(
         log.warning("imagenet_path not set; ImageNet-EEG dataset may fail.")
     identity = lambda x: x
     try:
-        train_split, test_split = create_EEG_dataset(
+        train_split, test_split = create_EEG_dataset_benchmark(
             eeg_signals_path=eeg_path,
             splits_path=splits_path,
             imagenet_path=imagenet_path,
             image_transform=identity,
             subject=4,
         )
+    except ImportError as e:
+        if "torch" in str(e).lower() or e.name == "torch":
+            log.error(
+                "ImageNet-EEG needs PyTorch to load .pth files (CPU wheel is enough): "
+                "pip install torch --index-url https://download.pytorch.org/whl/cpu"
+            )
+        else:
+            log.error("create_EEG_dataset_benchmark failed: %s", e)
+        return []
     except Exception as e:
-        log.error("create_EEG_dataset failed: %s", e)
+        log.error("create_EEG_dataset_benchmark failed: %s", e)
         return []
     dataset = test_split if split == "test" else train_split
     n = len(dataset)
     if max_samples is not None and max_samples > 0:
         n = min(n, max_samples)
     samples = []
-    for i in range(n):
+    idx_range = range(n)
+    if show_progress and n > 0:
+        idx_range = tqdm(
+            idx_range,
+            desc="Load ImageNet-EEG samples",
+            total=n,
+            unit="sample",
+        )
+    for i in idx_range:
         item = dataset[i]
         if isinstance(item, dict):
             eeg = item.get("eeg")
@@ -83,6 +101,7 @@ def get_thoughtviz_samples(
     config: BenchmarkConfig,
     split: str = "test",
     max_samples: Optional[int] = None,
+    show_progress: bool = True,
 ) -> List[Dict[str, Any]]:
     """Load ThoughtViz dataset and return list of unified sample dicts."""
     _ensure_code_on_path()
@@ -99,7 +118,11 @@ def get_thoughtviz_samples(
         split=split,
         max_samples=max_samples or config.max_samples,
     )
-    return [adapter[i] for i in range(len(adapter))]
+    n_ad = len(adapter)
+    idx_range = range(n_ad)
+    if show_progress and n_ad > 0:
+        idx_range = tqdm(idx_range, desc="Load ThoughtViz samples", total=n_ad, unit="sample")
+    return [adapter[i] for i in idx_range]
 
 
 def get_dataset(
@@ -107,14 +130,16 @@ def get_dataset(
     config: BenchmarkConfig,
     split: str = "test",
     max_samples: Optional[int] = None,
+    show_progress: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get dataset by name. Returns list of unified sample dicts.
     name: 'imagenet_eeg' | 'thoughtviz'
     """
+    sp = config.show_progress if show_progress is None else show_progress
     if name == "imagenet_eeg":
-        return get_imagenet_eeg_samples(config, split=split, max_samples=max_samples)
+        return get_imagenet_eeg_samples(config, split=split, max_samples=max_samples, show_progress=sp)
     if name == "thoughtviz":
-        return get_thoughtviz_samples(config, split=split, max_samples=max_samples)
+        return get_thoughtviz_samples(config, split=split, max_samples=max_samples, show_progress=sp)
     log.warning("Unknown dataset: %s", name)
     return []

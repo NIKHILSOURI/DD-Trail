@@ -90,13 +90,28 @@ class SummaryModel:
         if self._caption_pipe is not None:
             return
         from transformers import pipeline
-        try:
-            self._caption_pipe = pipeline("image-to-text", model=self.config.florence2_model_id)
-            self._caption_model_name = self.config.florence2_model_id
-        except Exception as e:
-            log.warning("Florence-2 load failed (%s). Falling back to %s", e, self.config.summary_fallback_model_id)
-            self._caption_pipe = pipeline("image-to-text", model=self.config.summary_fallback_model_id)
-            self._caption_model_name = self.config.summary_fallback_model_id
+        candidates = [
+            (self.config.florence2_model_id, True),
+            ("microsoft/Florence-2-base-ft", True),
+            (self.config.summary_fallback_model_id, False),
+            ("nlpconnect/vit-gpt2-image-captioning", False),
+        ]
+        last_err = None
+        for model_id, trust_remote in candidates:
+            try:
+                self._caption_pipe = pipeline(
+                    "image-to-text",
+                    model=model_id,
+                    trust_remote_code=trust_remote,
+                )
+                self._caption_model_name = model_id
+                if model_id != self.config.florence2_model_id:
+                    log.warning("Primary caption model unavailable. Using fallback: %s", model_id)
+                return
+            except Exception as e:
+                last_err = e
+                log.warning("Caption model load failed for %s (%s)", model_id, e)
+        raise RuntimeError("No caption model could be loaded: %s" % last_err)
 
     def _load_sentence_model(self) -> None:
         if self._sent_model is None:

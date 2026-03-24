@@ -7,18 +7,19 @@ from PIL import Image
 from keras.models import load_model
 from keras.optimizers import SGD, Adam
 from keras.utils import to_categorical
-import pickle
 import utils.data_input_util as inutil
+from utils.pickle_compat import load_pickle_compat
 from training.models.thoughtviz import *
 from utils.image_utils import *
 from utils.eval_utils import *
+from utils import thoughtviz_paths as tv_paths
 
 
 def train_gan(input_noise_dim, batch_size, epochs, data_dir, saved_classifier_model_file, model_save_dir, output_dir, classifier_model_file):
 
     K.set_learning_phase(False)
     # folders containing images used for training
-    imagenet_folder = "./images/ImageNet-Filtered"
+    imagenet_folder = tv_paths.training_images("ImageNet-Filtered")
     num_classes = 10
 
     feature_encoding_dim = 100
@@ -50,7 +51,7 @@ def train_gan(input_noise_dim, batch_size, epochs, data_dir, saved_classifier_mo
     g.summary()
     d.summary()
     
-    eeg_data = pickle.load(open(os.path.join(data_dir, 'data.pkl'), "rb"))
+    eeg_data = load_pickle_compat(os.path.join(data_dir, "data.pkl"))
     classifier = load_model(saved_classifier_model_file)
     classifier.summary()
     x_test = eeg_data[b'x_test']
@@ -128,20 +129,36 @@ def train():
     batch_size = 100
     run_id = 1
     epochs = 10000
-    model_save_dir = os.path.join('./saved_models/thoughtviz_image_with_eeg/', dataset, 'run_' + str(run_id))
+    subset = dataset.lower()
+    imagenet_folder = tv_paths.training_images("ImageNet-Filtered")
+    classifier_model_file = tv_paths.trained_image_classifier(subset)
+    eeg_data_dir = tv_paths.data_eeg(subset)
+    eeg_classifier_model_file = tv_paths.eeg_classifier_model(subset)
+    tv_paths.validate_image_eeg_prereqs(
+        imagenet_folder=imagenet_folder,
+        classifier_h5=classifier_model_file,
+        eeg_data_dir=eeg_data_dir,
+        eeg_classifier_h5=eeg_classifier_model_file,
+    )
+
+    model_save_dir = tv_paths.saved_models('thoughtviz_image_with_eeg', dataset, 'run_' + str(run_id))
     if not os.path.exists(model_save_dir):
         os.makedirs(model_save_dir)
 
-    output_dir = os.path.join('./outputs/thoughtviz_image_with_eeg/', dataset, 'run_' + str(run_id))
+    output_dir = tv_paths.outputs_dir('thoughtviz_image_with_eeg', dataset, 'run_' + str(run_id))
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    classifier_model_file = os.path.join('./trained_classifier_models', 'classifier_' + dataset.lower() + '.h5')
-
-    eeg_data_dir = os.path.join('../data/eeg/', dataset.lower())
-    eeg_classifier_model_file = os.path.join('../models/eeg_models', dataset.lower(), 'run_final.h5')
-
-    train_gan(input_noise_dim=100, batch_size=batch_size, epochs=epochs, splits_save_dir=eeg_data_dir, saved_classifier_model_file=eeg_classifier_model_file, model_save_dir=model_save_dir, output_dir=output_dir, classifier_model_file=classifier_model_file)
+    train_gan(
+        input_noise_dim=100,
+        batch_size=batch_size,
+        epochs=epochs,
+        data_dir=eeg_data_dir,
+        saved_classifier_model_file=eeg_classifier_model_file,
+        model_save_dir=model_save_dir,
+        output_dir=output_dir,
+        classifier_model_file=classifier_model_file,
+    )
 
 
 if __name__ == '__main__':

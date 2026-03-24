@@ -1,8 +1,14 @@
 # DreamDiffusion - Modern requirements for Windows compatibility
 # Tested with Python 3.10/3.11 on Windows
+#
+# Optional ThoughtViz (legacy Keras 2 / TensorFlow): do NOT install into the same
+# venv if pip conflicts; use a second env — see requirements-thoughtviz.txt
 
 # Required by many packages (pkg_resources). 68.x is stable with Python 3.10/3.11 and modern pip.
     setuptools==68.0.0
+
+# PyTorch 2.7+ imports TypeIs from here; old pins (e.g. 4.5) break `import torch`.
+typing_extensions>=4.12.0
 
 # Core ML libraries
 # Note: PyTorch should be installed separately via official instructions

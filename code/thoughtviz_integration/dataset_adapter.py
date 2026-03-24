@@ -59,22 +59,29 @@ def get_thoughtviz_sample(
     else:
         label = int(y_data[index])
     class_name = CLASS_NAMES[label] if label < len(CLASS_NAMES) else "Unknown"
-    # Try to find one image in that class folder for GT (arbitrary representative)
+    # ThoughtViz EEG pickle does not include a strict EEG->image identity mapping.
+    # We expose a deterministic same-class reference image as "ground truth" proxy.
     gt_image_path = None
     class_dir = image_dir / class_name
     if class_dir.is_dir():
+        files = []
         for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPEG", "*.JPG", "*.PNG"):
-            files = list(class_dir.glob(ext))
-            if files:
-                gt_image_path = str(files[0])
-                break
+            files.extend(list(class_dir.glob(ext)))
+        if files:
+            files = sorted(files)
+            gt_image_path = str(files[index % len(files)])
     return {
         "sample_id": "thoughtviz_%s_%04d" % (split, index),
         "eeg": eeg,
         "label": label,
         "class_name": class_name,
         "gt_image_path": gt_image_path,
-        "metadata": {"split": split, "index": index},
+        "metadata": {
+            "split": split,
+            "index": index,
+            "has_true_gt": False,
+            "gt_type": "class_reference",
+        },
         "split": split,
     }
 
@@ -96,6 +103,9 @@ class ThoughtVizDatasetAdapter:
             raise RuntimeError("ThoughtViz paths not resolved (root not found or missing data/image dirs).")
         self.data_dir = Path(self.data_dir)
         self.image_dir = Path(self.image_dir)
+        # Support passing training/images root; image classes are under ImageNet-Filtered.
+        if (self.image_dir / "ImageNet-Filtered").is_dir():
+            self.image_dir = self.image_dir / "ImageNet-Filtered"
         self.split = split
         self.max_samples = max_samples
         self._x_train, self._y_train, self._x_test, self._y_test = load_thoughtviz_pkl(self.data_dir)

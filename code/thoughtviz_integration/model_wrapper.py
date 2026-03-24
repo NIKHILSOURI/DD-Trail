@@ -16,6 +16,11 @@ from .utils import check_thoughtviz_available, resolve_thoughtviz_paths
 log = logging.getLogger("thoughtviz_wrapper")
 
 
+def _is_nchw_cpu_conv_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "conv2d" in msg and "cpu" in msg and "nchw" in msg and "nhwc" in msg
+
+
 class ThoughtVizWrapper:
     """
     Wrapper for ThoughtViz inference: EEG -> generator -> image.
@@ -29,6 +34,7 @@ class ThoughtVizWrapper:
         self._generator = None
         self._get_encoding_fn = None
         self._loaded = False
+        self._cpu_only = True
 
     def load_pretrained(self) -> bool:
         """Load EEG classifier and GAN generator. Returns True on success."""
@@ -47,6 +53,7 @@ class ThoughtVizWrapper:
         try:
             import keras.backend as K
             from keras.models import load_model
+            from tensorflow import config as tf_config
         except ImportError as e:
             log.warning("Keras not available; ThoughtViz wrapper cannot load models: %s", e)
             return False
@@ -59,18 +66,59 @@ class ThoughtVizWrapper:
             custom = {"MoGLayer": MoGLayer}
             self._classifier = load_model(str(eeg_path), custom_objects=custom)
             self._generator = load_model(str(gan_path), custom_objects=custom)
+            try:
+                self._cpu_only = len(tf_config.list_physical_devices("GPU")) == 0
+            except Exception:
+                self._cpu_only = True
             layer_index = getattr(self.config, "feature_layer_index", 9)
             self._get_encoding_fn = K.function(
                 [self._classifier.layers[0].input],
                 [self._classifier.layers[layer_index].output],
             )
-            K.set_learning_phase(0)
+            # Keras 3 removed set_learning_phase; keep legacy behavior when available.
+            if hasattr(K, "set_learning_phase"):
+                K.set_learning_phase(0)
             self._loaded = True
             log.info("ThoughtViz loaded: classifier %s, generator %s", eeg_path, gan_path)
             return True
         except Exception as e:
             log.exception("ThoughtViz load failed: %s", e)
             return False
+
+    def _fallback_conditioning(self, eeg_batch: np.ndarray, batch_size: int) -> np.ndarray:
+        """
+        Build deterministic conditioning vectors directly from EEG when classifier
+        encoding fails on CPU due legacy NCHW Conv2D constraints.
+        """
+        enc_dim = int(self._generator.input_shape[1][-1])
+        flat = eeg_batch.reshape(batch_size, -1).astype(np.float32)
+        if flat.shape[1] == enc_dim:
+            out = flat
+        elif flat.shape[1] > enc_dim:
+            idx = np.linspace(0, flat.shape[1] - 1, enc_dim).astype(np.int64)
+            out = flat[:, idx]
+        else:
+            rep = int(np.ceil(float(enc_dim) / float(flat.shape[1])))
+            out = np.tile(flat, (1, rep))[:, :enc_dim]
+        mean = out.mean(axis=1, keepdims=True)
+        std = out.std(axis=1, keepdims=True) + 1e-6
+        return ((out - mean) / std).astype(np.float32)
+
+    def _encode_eeg(self, eeg_batch: np.ndarray) -> np.ndarray:
+        batch_size = eeg_batch.shape[0]
+        try:
+            enc = self._get_encoding_fn([eeg_batch])[0]
+            if enc.shape[0] != batch_size:
+                enc = np.repeat(enc[:1], batch_size, axis=0)
+            return enc.astype(np.float32)
+        except Exception as e:
+            if self._cpu_only and _is_nchw_cpu_conv_error(e):
+                log.warning(
+                    "ThoughtViz classifier encoding hit CPU NCHW Conv2D limitation. "
+                    "Using EEG-projection conditioning fallback to keep inference running."
+                )
+                return self._fallback_conditioning(eeg_batch, batch_size)
+            raise
 
     def generate_from_eeg(
         self,
@@ -91,9 +139,7 @@ class ThoughtVizWrapper:
         B = eeg_batch.shape[0]
         noise_dim = getattr(self.config, "input_noise_dim", 100)
         noise = np.random.uniform(-1, 1, (B, noise_dim)).astype(np.float32)
-        enc = self._get_encoding_fn([eeg_batch])[0]
-        if enc.shape[0] != B:
-            enc = np.repeat(enc[:1], B, axis=0)
+        enc = self._encode_eeg(eeg_batch)
         out = self._generator.predict([noise, enc], verbose=0)
         # out: (B, H, W, 3) in [-1, 1]
         out = (out * 127.5 + 127.5).clip(0, 255).astype(np.uint8)

@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 
 from .benchmark_config import BenchmarkConfig
+from .progress_util import tqdm
 from .summary_metrics import compare_summary_dicts
 from .summary_model import SummaryModel
 from .utils import ensure_dir, load_json, save_json, setup_logger
@@ -27,10 +28,29 @@ def _sample_dirs(output_dir: Path, dataset_name: str) -> List[Path]:
 
 
 def run_summary_eval(output_dir: Path, dataset_name: str, config: BenchmarkConfig) -> Dict[str, Any]:
-    model = SummaryModel(config)
+    log.info("Initializing summary/caption models (first run may download Hugging Face weights) …")
+    try:
+        model = SummaryModel(config)
+    except (ModuleNotFoundError, RuntimeError) as e:
+        out_root = output_dir.parent / "summary_metrics" / dataset_name
+        ensure_dir(out_root)
+        agg: Dict[str, Any] = {
+            "dataset": dataset_name,
+            "n_rows": 0,
+            "by_model": {},
+            "status": "skipped_missing_dependency",
+            "error": str(e),
+        }
+        log.warning("Summary eval skipped for %s (missing dependency): %s", dataset_name, e)
+        save_json(agg, out_root / "summary_metrics.json")
+        return agg
     rows: List[Dict[str, Any]] = []
     samples = _sample_dirs(output_dir, dataset_name)
-    for sdir in samples:
+    sp = getattr(config, "show_progress", True)
+    s_iter = samples
+    if sp and samples:
+        s_iter = tqdm(samples, desc="Summary eval (%s)" % dataset_name, unit="sample")
+    for sdir in s_iter:
         ssum = sdir / "summaries"
         ensure_dir(ssum)
         paths = {
@@ -42,7 +62,21 @@ def run_summary_eval(output_dir: Path, dataset_name: str, config: BenchmarkConfi
         if not paths["gt"].exists():
             continue
         gt_img = _read_img(paths["gt"])
-        gt_sum = model.summarize(gt_img, "gt").to_dict()
+        try:
+            gt_sum = model.summarize(gt_img, "gt").to_dict()
+        except (ModuleNotFoundError, RuntimeError) as e:
+            out_root = output_dir.parent / "summary_metrics" / dataset_name
+            ensure_dir(out_root)
+            agg: Dict[str, Any] = {
+                "dataset": dataset_name,
+                "n_rows": 0,
+                "by_model": {},
+                "status": "skipped_missing_dependency",
+                "error": str(e),
+            }
+            log.warning("Summary eval skipped for %s (missing dependency): %s", dataset_name, e)
+            save_json(agg, out_root / "summary_metrics.json")
+            return agg
         save_json(gt_sum, ssum / "summary_gt.json")
         per_cmp = {}
         for m in ("thoughtviz", "dreamdiffusion", "sarhm"):
@@ -52,10 +86,29 @@ def run_summary_eval(output_dir: Path, dataset_name: str, config: BenchmarkConfi
             img = _read_img(paths[m])
             pred_sum = model.summarize(img, m).to_dict()
             save_json(pred_sum, ssum / ("summary_%s.json" % m))
-            sem = model.sentence_cosine(gt_sum["detailed_caption"], pred_sum["detailed_caption"])
-            clip_self = model.clip_text_image_score(img, pred_sum["detailed_caption"])
+            sem = 0.0
+            clip_self = 0.0
+            sem_status = "ok"
+            clip_status = "ok"
+            try:
+                sem = model.sentence_cosine(gt_sum["detailed_caption"], pred_sum["detailed_caption"])
+            except ModuleNotFoundError as e:
+                sem_status = "missing_dependency"
+                log.warning("Sentence similarity skipped for %s/%s: %s", dataset_name, m, e)
+            try:
+                clip_self = model.clip_text_image_score(img, pred_sum["detailed_caption"])
+            except ModuleNotFoundError as e:
+                clip_status = "missing_dependency"
+                log.warning("CLIP score skipped for %s/%s: %s", dataset_name, m, e)
             cmp_row = compare_summary_dicts(gt_sum, pred_sum, sem, clip_self)
-            cmp_row.update({"sample_id": sdir.name, "model": m, "dataset": dataset_name, "status": "ok"})
+            cmp_row.update({
+                "sample_id": sdir.name,
+                "model": m,
+                "dataset": dataset_name,
+                "status": "ok",
+                "summary_semantic_similarity_status": sem_status,
+                "clip_text_image_score_status": clip_status,
+            })
             rows.append(cmp_row)
             per_cmp[m] = cmp_row
         save_json(per_cmp, ssum / "summary_comparison.json")

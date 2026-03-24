@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
 
 from .benchmark_config import BenchmarkConfig
 from .output_standardizer import _to_uint8
@@ -27,6 +26,84 @@ def _ensure_code_on_path() -> None:
         sys.path.insert(0, str(CODE_DIR))
 
 
+# eLDM MAE PatchEmbed1D: in_chans=128, time_len=512 → tensor layout (B, 128, 512).
+# eLDM_eval.generate uses einops repeat(latent, 'h w -> c h w'), so each item must be 2D (128, 512).
+_LDM_EEG_H = 128
+_LDM_EEG_W = 512
+
+# ThoughtViz Keras EEG encoder: fixed spatial grid (see pretrained classifier input).
+_THOUGHTVIZ_H = 14
+_THOUGHTVIZ_W = 32
+
+
+def _prepare_eeg_for_thoughtviz(eeg: Any) -> np.ndarray:
+    """
+    Map any benchmark EEG tensor/array to float32 (14, 32, 1) for ThoughtViz.
+    ImageNet-EEG is (128, 512); we resize with scipy (order=1) to match the Keras model.
+    """
+    th, tw = _THOUGHTVIZ_H, _THOUGHTVIZ_W
+    if isinstance(eeg, np.ndarray):
+        x = np.asarray(eeg, dtype=np.float32)
+    elif hasattr(eeg, "detach"):
+        x = eeg.detach().float().cpu().numpy()
+    elif hasattr(eeg, "numpy"):
+        x = np.asarray(eeg.numpy(), dtype=np.float32)
+    else:
+        x = np.asarray(eeg, dtype=np.float32)
+    while x.ndim >= 3 and x.shape[0] == 1:
+        x = x.squeeze(0)
+    if x.ndim == 3 and x.shape[-1] == 1:
+        plane = x[..., 0]
+    elif x.ndim == 2:
+        plane = x
+    elif x.ndim == 3:
+        plane = x[..., 0]
+    else:
+        raise ValueError(
+            "ThoughtViz EEG must be 2D or H×W×C; got shape %s" % (x.shape,)
+        )
+    if plane.shape == (th, tw):
+        return plane[..., np.newaxis].astype(np.float32)
+    from scipy.ndimage import zoom
+
+    zh = th / plane.shape[0]
+    zw = tw / plane.shape[1]
+    plane = zoom(plane, (zh, zw), order=1).astype(np.float32)
+    return plane[..., np.newaxis]
+
+
+def _prepare_eeg_for_ldm(eeg: Any) -> Any:
+    """
+    Convert dataset EEG to float32 [128, 512] for DreamDiffusion/SAR-HM generate().
+    ImageNet-EEG is already (128, 512); ThoughtViz and others are resized with bilinear
+    so the checkpoint encoder receives the expected grid size (not identical semantics to training).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if isinstance(eeg, torch.Tensor):
+        t = eeg.detach().float().cpu()
+    else:
+        t = torch.as_tensor(np.asarray(eeg), dtype=torch.float32)
+    # Accidental batch dimension from older code paths: (1, H, W)
+    if t.dim() == 3 and t.shape[0] == 1:
+        t = t.squeeze(0)
+    while t.dim() > 2 and t.shape[-1] == 1:
+        t = t.squeeze(-1)
+    if t.dim() != 2:
+        raise ValueError(
+            "EEG must be 2D [H,W] (or 1×H×W) for LDM conditioning; got shape %s" % (tuple(t.shape),)
+        )
+    h, w = _LDM_EEG_H, _LDM_EEG_W
+    if t.shape == (w, h):
+        t = t.t()
+    elif t.shape != (h, w):
+        x = t.unsqueeze(0).unsqueeze(0)
+        x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
+        t = x.squeeze(0).squeeze(0)
+    return t.contiguous()
+
+
 class _ListDataset:
     """Minimal dataset wrapper for LDM generate(): list of dicts with 'eeg' and 'image'."""
 
@@ -40,7 +117,7 @@ class _ListDataset:
         return self.items[i]
 
 
-def get_thoughtviz_wrapper(config: BenchmarkConfig):
+def get_thoughtviz_wrapper(config: BenchmarkConfig, dataset_name: Optional[str] = None):
     """Return ThoughtViz wrapper instance (lazy load on first generate)."""
     _ensure_code_on_path()
     try:
@@ -49,17 +126,36 @@ def get_thoughtviz_wrapper(config: BenchmarkConfig):
     except ImportError as e:
         log.warning("ThoughtViz wrapper not available: %s", e)
         return None
+    eeg_model_path = config.thoughtviz_eeg_model_path
+    gan_model_path = config.thoughtviz_gan_model_path
+    # Guard against accidental Char checkpoints on ImageNet-EEG runs.
+    if dataset_name == "imagenet_eeg":
+        eeg_s = str(eeg_model_path or "").lower()
+        gan_s = str(gan_model_path or "").lower()
+        if any(k in eeg_s for k in ("/char/", "\\char\\", "/digit/", "\\digit\\")) or any(
+            k in gan_s for k in ("/char/", "\\char\\", "/digit/", "\\digit\\")
+        ):
+            msg = (
+                "ThoughtViz checkpoints look non-image for imagenet_eeg dataset "
+                "(eeg=%s, gan=%s). Image checkpoints are recommended for meaningful outputs."
+            )
+            if getattr(config, "thoughtviz_strict_checkpoint_match", False):
+                log.error(msg, eeg_model_path, gan_model_path)
+                return None
+            log.warning(msg, eeg_model_path, gan_model_path)
     tv_config = ThoughtVizConfig(
         data_dir=config.thoughtviz_data_dir,
         image_dir=config.thoughtviz_image_dir,
-        eeg_model_path=config.thoughtviz_eeg_model_path,
-        gan_model_path=config.thoughtviz_gan_model_path,
+        eeg_model_path=eeg_model_path,
+        gan_model_path=gan_model_path,
     )
     return ThoughtVizWrapper(config=tv_config)
 
 
 def get_dreamdiffusion_wrapper(config: BenchmarkConfig, use_sarhm: bool = False):
     """Load DreamDiffusion (baseline or SAR-HM) via utils_eval; return (generative_model, device)."""
+    import torch
+
     _ensure_code_on_path()
     from utils_eval import load_model
     ckpt = config.sarhm_ckpt if use_sarhm else config.dreamdiffusion_baseline_ckpt
@@ -67,6 +163,7 @@ def get_dreamdiffusion_wrapper(config: BenchmarkConfig, use_sarhm: bool = False)
         log.warning("Checkpoint not found: %s", ckpt)
         return None
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info("Loading checkpoint (this can take a few minutes): %s", ckpt)
     try:
         model, cfg = load_model(
             ckpt,
@@ -80,6 +177,7 @@ def get_dreamdiffusion_wrapper(config: BenchmarkConfig, use_sarhm: bool = False)
             cfg.proto_path = config.sarhm_proto_path
             # Reload if needed; for now load_model uses ckpt config - proto_path may be in ckpt dir
             pass
+        log.info("Checkpoint ready: %s", ckpt)
         return (model, device, cfg)
     except Exception as e:
         log.exception("DreamDiffusion load failed: %s", e)
@@ -87,12 +185,15 @@ def get_dreamdiffusion_wrapper(config: BenchmarkConfig, use_sarhm: bool = False)
 
 
 def generate_dreamdiffusion(
-    model_device_cfg: Tuple[Any, torch.device, Any],
+    model_device_cfg: Tuple[Any, Any, Any],
     samples: List[Dict[str, Any]],
     num_samples_per_item: int = 1,
     ddim_steps: int = 250,
+    pbar_desc: Optional[str] = None,
 ) -> List[np.ndarray]:
     """Run DreamDiffusion/SAR-HM generate on list of unified samples; return list of (H,W,3) uint8."""
+    import torch
+
     model, device, cfg = model_device_cfg
     # Build minimal dataset with 'eeg' and 'image' (GT for concatenation in generate)
     items = []
@@ -104,13 +205,7 @@ def generate_dreamdiffusion(
             gt = np.array(Image.open(s["gt_image_path"]).convert("RGB")) / 255.0
         if gt is None:
             gt = np.zeros((64, 64, 3), dtype=np.float32)  # placeholder
-        if hasattr(eeg, "numpy"):
-            eeg = eeg.numpy()
-        if hasattr(eeg, "cpu"):
-            eeg = eeg.cpu().numpy()
-        eeg = torch.as_tensor(eeg, dtype=torch.float32)
-        if eeg.dim() == 2:
-            eeg = eeg.unsqueeze(0)  # (1, T, C) for conditioning
+        eeg = _prepare_eeg_for_ldm(eeg)
         if isinstance(gt, np.ndarray):
             if gt.ndim == 2:
                 gt = np.stack([gt] * 3, axis=-1)
@@ -131,17 +226,24 @@ def generate_dreamdiffusion(
         output_path=None,
         cfg_scale=1.0,
         cfg_uncond="zeros",
+        pbar_desc=pbar_desc,
     )
-    # all_samples: list of (1+num_samples, C, H, W) tensor; first is GT, rest generated
+    # all_samples: numpy (N, 1+num_samples, C, H, W) uint8 from eLDM_eval.generate, or legacy torch list
     out = []
     for batch in all_samples:
         # batch: (1+num_samples, C, H, W)
-        gen = batch[1]  # first generated
-        arr = gen.numpy()
+        gen = batch[1]  # first generated (skip GT at index 0)
+        if isinstance(gen, torch.Tensor):
+            arr = gen.detach().float().cpu().numpy()
+        else:
+            arr = np.asarray(gen)
+        if arr.dtype == np.uint8:
+            arr = arr.astype(np.float32) / 255.0
+        else:
+            arr = np.clip(arr.astype(np.float32), 0.0, 1.0)
         if arr.shape[0] == 3:
             arr = np.transpose(arr, (1, 2, 0))
-        arr = (np.clip(arr, 0, 1) * 255).astype(np.uint8)
-        out.append(arr)
+        out.append((np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8))
     return out
 
 
@@ -150,22 +252,21 @@ def generate_thoughtviz(
     samples: List[Dict[str, Any]],
 ) -> List[np.ndarray]:
     """Run ThoughtViz on list of samples; return list of (H,W,3) uint8."""
-    eeg_list = [s["eeg"] for s in samples]
-    if hasattr(eeg_list[0], "numpy"):
-        eeg_list = [e.cpu().numpy() if hasattr(e, "cpu") else e.numpy() for e in eeg_list]
+    eeg_list = [_prepare_eeg_for_thoughtviz(s["eeg"]) for s in samples]
     return wrapper.generate_from_eeg(eeg_list, num_samples=1)
 
 
 def get_model(
     name: str,
     config: BenchmarkConfig,
+    dataset_name: Optional[str] = None,
 ) -> Optional[Any]:
     """
     Get model by name. Returns wrapper or (model, device, cfg) for DreamDiffusion/SAR-HM.
     name: 'thoughtviz' | 'dreamdiffusion' | 'sarhm'
     """
     if name == "thoughtviz":
-        return get_thoughtviz_wrapper(config)
+        return get_thoughtviz_wrapper(config, dataset_name=dataset_name)
     if name == "dreamdiffusion":
         return get_dreamdiffusion_wrapper(config, use_sarhm=False)
     if name == "sarhm":

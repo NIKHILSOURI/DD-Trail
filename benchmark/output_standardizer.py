@@ -26,6 +26,15 @@ def _to_uint8(img: Union[np.ndarray, "Image.Image"]) -> np.ndarray:
         img = img.numpy()
     if isinstance(img, Image.Image):
         img = np.array(img)
+    img = np.asarray(img)
+    # Accept accidental leading singleton batch dims from model wrappers.
+    while img.ndim > 3 and img.shape[0] == 1:
+        img = img[0]
+    # Normalize common grayscale layouts before PIL conversion.
+    if img.ndim == 2:
+        img = np.stack([img] * 3, axis=-1)
+    elif img.ndim == 3 and img.shape[-1] == 1:
+        img = np.repeat(img, 3, axis=-1)
     if img.ndim == 3 and img.shape[0] == 3:
         img = np.transpose(img, (1, 2, 0))
     if img.dtype != np.uint8:

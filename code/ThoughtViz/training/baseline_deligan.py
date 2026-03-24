@@ -10,12 +10,13 @@ from keras.utils import to_categorical
 import utils.data_input_util as inutil
 from training.models.deligan import *
 from utils.image_utils import *
+from utils import thoughtviz_paths as tv_paths
 
 
 def train_gan(dataset, input_noise_dim, batch_size, epochs, model_save_dir, output_dir):
 
     # folders containing images used for training
-    char_fonts_folders = ["./images/Char-Font"]
+    char_fonts_folders = [tv_paths.training_images("Char-Font")]
     num_classes = 10
 
     # load data and compile discriminator, generator models depending on the dataaset
@@ -102,11 +103,21 @@ def train():
     batch_size = 100
     run_id = 1
     epochs = 500
-    model_save_dir = os.path.join('./saved_models/baseline_deligan/', folder_name_mapping[dataset], 'run_' + str(run_id))
+    tv_paths.validate_label_gan_prereqs(
+        dataset,
+        char_font_dir=tv_paths.training_images("Char-Font"),
+        classifier_h5=None,
+    )
+
+    model_save_dir = tv_paths.saved_models(
+        'baseline_deligan', folder_name_mapping[dataset], 'run_' + str(run_id)
+    )
     if not os.path.exists(model_save_dir):
         os.makedirs(model_save_dir)
 
-    output_dir = os.path.join('./outputs/baseline_deligan/', folder_name_mapping[dataset], 'run_' + str(run_id))
+    output_dir = tv_paths.outputs_dir(
+        'baseline_deligan', folder_name_mapping[dataset], 'run_' + str(run_id)
+    )
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 

@@ -8,12 +8,13 @@ import utils.data_input_util as inutil
 from training.models.ac_gan import *
 from utils.eval_utils import *
 from utils.image_utils import *
+from utils import thoughtviz_paths as tv_paths
 
 
 def train_gan(input_noise_dim, batch_size, epochs, model_save_dir, output_dir):
 
     # folders containing images used for training
-    imagenet_folder = "./images/ImageNet-Filtered"
+    imagenet_folder = tv_paths.training_images("ImageNet-Filtered")
     
     num_classes = 10
 
@@ -112,11 +113,13 @@ def train():
     batch_size = 32
     run_id = 5
     epochs = 1000
-    model_save_dir = os.path.join('./saved_models/baseline_acgan_image/', dataset, 'run_' + str(run_id))
+    tv_paths.validate_imagenet_filtered(tv_paths.training_images("ImageNet-Filtered"))
+
+    model_save_dir = tv_paths.saved_models('baseline_acgan_image', dataset, 'run_' + str(run_id))
     if not os.path.exists(model_save_dir):
         os.makedirs(model_save_dir)
 
-    output_dir = os.path.join('./outputs/baseline_acgan_image/', dataset, 'run_' + str(run_id))
+    output_dir = tv_paths.outputs_dir('baseline_acgan_image', dataset, 'run_' + str(run_id))
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 

@@ -1,24 +1,43 @@
 import logging
 import os
-import pickle
 import random
+
+import tensorflow as tf
+
+# Prefer GPU when available; grow memory instead of grabbing all VRAM at once.
+try:
+    for _gpu in tf.config.list_physical_devices("GPU"):
+        try:
+            tf.config.experimental.set_memory_growth(_gpu, True)
+        except Exception:
+            pass
+except Exception:
+    pass
+
+_gpus = tf.config.list_physical_devices("GPU")
+print(
+    "[thoughtviz_with_eeg] TensorFlow physical GPUs:",
+    [d.name for d in _gpus] if _gpus else "none (CPU only)",
+)
 
 from PIL import Image
 from keras import backend as K
 from keras.models import load_model
-from keras.optimizers import Adam
 from keras.utils import to_categorical
 
 import utils.data_input_util as inutil
 from training.models.thoughtviz import *
 from utils.image_utils import *
+from utils.keras_compat import adam_opt, set_learning_phase_inference
+from utils import thoughtviz_paths as tv_paths
+from utils.pickle_compat import load_pickle_compat
 
 
 def train_gan(dataset, input_noise_dim, batch_size, epochs, data_dir, saved_classifier_model_file, model_save_dir, output_dir, classifier_model_file):
 
-    K.set_learning_phase(False)
-    # folders containing images used for training
-    char_fonts_folders = ["./images/Char-Font"]
+    set_learning_phase_inference()
+    # folders containing images used for training (under training/images per README)
+    char_fonts_folders = [tv_paths.training_images("Char-Font")]
     num_classes = 10
 
     feature_encoding_dim = 100
@@ -38,12 +57,12 @@ def train_gan(dataset, input_noise_dim, batch_size, epochs, data_dir, saved_clas
     c = load_model(classifier_model_file)
 
     d = discriminator_model((28, 28), c)
-    d_optim = Adam(lr=adam_lr, beta_1=adam_beta_1)
+    d_optim = adam_opt(adam_lr, beta_1=adam_beta_1)
     d.compile(loss=['binary_crossentropy','categorical_crossentropy'], optimizer=d_optim)
     d.trainable = True
 
     g = generator_model(input_noise_dim, feature_encoding_dim)
-    g_optim = Adam(lr=adam_lr, beta_1=adam_beta_1)
+    g_optim = adam_opt(adam_lr, beta_1=adam_beta_1)
     g.compile(loss='categorical_crossentropy', optimizer=g_optim)
 
     d_on_g = generator_containing_discriminator(input_noise_dim, feature_encoding_dim, g, d)
@@ -52,7 +71,7 @@ def train_gan(dataset, input_noise_dim, batch_size, epochs, data_dir, saved_clas
     g.summary()
     d.summary()
     
-    eeg_data = pickle.load(open(os.path.join(data_dir, 'data.pkl'), "rb"))
+    eeg_data = load_pickle_compat(os.path.join(data_dir, "data.pkl"))
     classifier = load_model(saved_classifier_model_file)
     classifier.summary()
     x_test = eeg_data[b'x_test']
@@ -119,18 +138,31 @@ def train():
     batch_size = 100
     run_id = 1
     epochs = 500
-    model_save_dir = os.path.join('./saved_models/thoughtviz_with_eeg/', folder_name_mapping[dataset], 'run_' + str(run_id))
+    subset = folder_name_mapping[dataset].lower()
+    char_font_dir = tv_paths.training_images("Char-Font")
+    classifier_model_file = tv_paths.trained_image_classifier(subset)
+    eeg_data_dir = tv_paths.data_eeg(subset)
+    eeg_classifier_model_file = tv_paths.eeg_classifier_model(subset)
+
+    tv_paths.validate_eeg_gan_prereqs(
+        dataset,
+        char_font_dir=char_font_dir,
+        classifier_h5=classifier_model_file,
+        eeg_data_dir=eeg_data_dir,
+        eeg_classifier_h5=eeg_classifier_model_file,
+    )
+
+    model_save_dir = tv_paths.saved_models(
+        'thoughtviz_with_eeg', folder_name_mapping[dataset], 'run_' + str(run_id)
+    )
     if not os.path.exists(model_save_dir):
         os.makedirs(model_save_dir)
 
-    output_dir = os.path.join('./outputs/thoughtviz_with_eeg/', folder_name_mapping[dataset], 'run_' + str(run_id))
+    output_dir = tv_paths.outputs_dir(
+        'thoughtviz_with_eeg', folder_name_mapping[dataset], 'run_' + str(run_id)
+    )
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-
-    classifier_model_file = os.path.join('./trained_classifier_models', 'classifier_' + folder_name_mapping[dataset].lower() + '.h5')
-
-    eeg_data_dir = os.path.join('../data/eeg', folder_name_mapping[dataset].lower())
-    eeg_classifier_model_file = os.path.join('../models/eeg_models', folder_name_mapping[dataset].lower(), 'run_final.h5')
 
     train_gan(dataset=dataset, input_noise_dim=100, batch_size=batch_size, epochs=epochs, data_dir=eeg_data_dir, saved_classifier_model_file=eeg_classifier_model_file, model_save_dir=model_save_dir, output_dir=output_dir, classifier_model_file=classifier_model_file)
 

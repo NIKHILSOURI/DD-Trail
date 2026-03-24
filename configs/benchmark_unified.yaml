@@ -1,0 +1,31 @@
+seed: 2022
+max_samples: null
+ddim_steps: 250
+num_samples_per_item: 1
+show_progress: true
+dataset: both
+models:
+- thoughtviz
+- dreamdiffusion
+- sarhm
+paths:
+  repo_root: /workspace/project/DREAMDIFFUSION_RUNPOD
+  imagenet_path: /workspace/project/DREAMDIFFUSION_RUNPOD/datasets/imageNet_images
+  eeg_signals_path: /workspace/project/DREAMDIFFUSION_RUNPOD/datasets/eeg_5_95_std.pth
+  splits_path: /workspace/project/DREAMDIFFUSION_RUNPOD/datasets/block_splits_by_image_single.pth
+  thoughtviz_data_dir: /workspace/project/DREAMDIFFUSION_RUNPOD/code/ThoughtViz/data
+  thoughtviz_image_dir: /workspace/project/DREAMDIFFUSION_RUNPOD/code/ThoughtViz/training/images
+  baseline_ckpt: /workspace/project/DREAMDIFFUSION_RUNPOD/exps/results/generation/21-03-2026-10-40-21/checkpoint_best.pth
+  sarhm_ckpt: /workspace/project/DREAMDIFFUSION_RUNPOD/exps/results/generation/22-03-2026-00-42-46/checkpoint_best.pth
+  sarhm_proto: /workspace/project/DREAMDIFFUSION_RUNPOD/exps/results/generation/22-03-2026-00-42-46/prototypes.pt
+  thoughtviz_eeg_model_path: /workspace/project/DREAMDIFFUSION_RUNPOD/code/ThoughtViz/models/eeg_models/image/run_final.h5
+  thoughtviz_gan_model_path: /workspace/project/DREAMDIFFUSION_RUNPOD/code/ThoughtViz/saved_models/thoughtviz_with_eeg/Char/run_1/generator_99
+output:
+  root: /workspace/project/DREAMDIFFUSION_RUNPOD/results/benchmark_unified
+  run_name: thesis_unified
+  clean_before_run: false
+evaluation:
+  summary_enabled: true
+  segmentation_enabled: true
+  strict_eval: false
+  thoughtviz_strict_checkpoint_match: false

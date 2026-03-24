@@ -18,6 +18,7 @@ if CODE_DIR.is_dir() and str(CODE_DIR) not in sys.path:
 
 from benchmark.benchmark_config import BenchmarkConfig
 from benchmark.benchmark_runner import run_all_models
+from benchmark.progress_util import tqdm
 from benchmark.caption_eval import run_caption_eval
 from benchmark.segmentation_eval import run_segmentation_eval
 from benchmark.utils import setup_logger
@@ -42,11 +43,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sarhm_proto", type=str, default=None)
     p.add_argument("--thoughtviz_data_dir", type=str, default=None)
     p.add_argument("--thoughtviz_image_dir", type=str, default=None)
+    p.add_argument(
+        "--thoughtviz_eeg_model_path",
+        type=str,
+        default=None,
+        help="Keras EEG classifier .h5 (e.g. models/eeg_models/char/run_final.h5)",
+    )
+    p.add_argument(
+        "--thoughtviz_gan_model_path",
+        type=str,
+        default=None,
+        help="Keras generator SavedModel dir (e.g. saved_models/thoughtviz_with_eeg/Char/run_1/generator_N)",
+    )
     p.add_argument("--seed", type=int, default=2022)
     p.add_argument("--ddim_steps", type=int, default=250)
     p.add_argument("--summary_enabled", type=str, default="true", choices=["true", "false"])
     p.add_argument("--segmentation_enabled", type=str, default="true", choices=["true", "false"])
     p.add_argument("--strict_eval", type=str, default="false", choices=["true", "false"])
+    p.add_argument(
+        "--progress",
+        type=str,
+        default="true",
+        choices=["true", "false"],
+        help="Show tqdm bars and stage logs (dataset load, checkpoints, generation, eval)",
+    )
     p.add_argument("--florence2_model_id", type=str, default=None)
     p.add_argument("--summary_sentence_model_id", type=str, default=None)
     p.add_argument("--grounding_dino_model_id", type=str, default=None)
@@ -65,6 +85,7 @@ def main() -> int:
     config.summary_enabled = args.summary_enabled == "true"
     config.segmentation_enabled = args.segmentation_enabled == "true"
     config.strict_eval = args.strict_eval == "true"
+    config.show_progress = args.progress == "true"
     if args.florence2_model_id:
         config.florence2_model_id = args.florence2_model_id
     if args.summary_sentence_model_id:
@@ -94,19 +115,32 @@ def main() -> int:
         config.thoughtviz_data_dir = args.thoughtviz_data_dir
     if args.thoughtviz_image_dir:
         config.thoughtviz_image_dir = args.thoughtviz_image_dir
+    if args.thoughtviz_eeg_model_path:
+        config.thoughtviz_eeg_model_path = args.thoughtviz_eeg_model_path
+    if args.thoughtviz_gan_model_path:
+        config.thoughtviz_gan_model_path = args.thoughtviz_gan_model_path
 
     import os
     if os.environ.get("IMAGENET_PATH") and not config.imagenet_path:
         config.imagenet_path = os.environ.get("IMAGENET_PATH")
+    if not config.thoughtviz_eeg_model_path and os.environ.get("THOUGHTVIZ_EEG_MODEL_PATH"):
+        config.thoughtviz_eeg_model_path = os.environ.get("THOUGHTVIZ_EEG_MODEL_PATH")
+    if not config.thoughtviz_gan_model_path and os.environ.get("THOUGHTVIZ_GAN_MODEL_PATH"):
+        config.thoughtviz_gan_model_path = os.environ.get("THOUGHTVIZ_GAN_MODEL_PATH")
 
     datasets = ["imagenet_eeg", "thoughtviz"] if args.dataset == "both" else [args.dataset]
-    for ds in datasets:
+    ds_iter = datasets
+    if config.show_progress:
+        ds_iter = tqdm(datasets, desc="Benchmark datasets", unit="dataset")
+    for ds in ds_iter:
         log.info("Benchmark dataset: %s (max_samples=%s)", ds, config.max_samples)
         run_all_models(ds, config, max_samples=config.max_samples, models=config.models)
         try:
             if config.summary_enabled:
+                log.info("Summary / caption eval: %s", ds)
                 run_caption_eval(Path(config.output_dir), ds, config=config)
             if config.segmentation_enabled:
+                log.info("Segmentation eval: %s", ds)
                 run_segmentation_eval(Path(config.output_dir), ds, config=config)
         except Exception as e:
             if config.strict_eval:

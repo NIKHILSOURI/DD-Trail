@@ -1,4 +1,3 @@
-import pickle
 import random
 
 import keras.backend as K
@@ -8,6 +7,7 @@ from keras.utils import to_categorical
 
 from layers.mog_layer import *
 from utils.image_utils import *
+from utils.pickle_compat import load_pickle_compat
 
 
 class Tests():
@@ -41,7 +41,7 @@ class Tests():
         K.set_learning_phase(False)
 
         # load EEG data
-        eeg_data = pickle.load(open(eeg_pkl_file, "rb"), encoding='bytes')
+        eeg_data = load_pickle_compat(eeg_pkl_file)
         classifier = load_model(classifier_model)
 
         x_test = eeg_data[b'x_test']

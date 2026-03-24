@@ -1,11 +1,11 @@
 import os
-import pickle
 
 import keras
 from keras import optimizers
 from keras.callbacks import ModelCheckpoint
 
 from training.models.classification import *
+from utils.pickle_compat import load_pickle_compat
 
 
 class EEG_Classifier():
@@ -17,9 +17,14 @@ class EEG_Classifier():
 
     def train(self, model_save_dir, run_id, batch_size, num_epochs):
         
-        data = pickle.load(open(self.eeg_pkl_file, 'rb'), encoding='bytes')
+        data = load_pickle_compat(self.eeg_pkl_file)
 
-        x_train, y_train, x_test, y_test = data['x_train'], data['y_train'], data['x_test'], data['y_test']
+        x_train, y_train, x_test, y_test = (
+            data[b"x_train"],
+            data[b"y_train"],
+            data[b"x_test"],
+            data[b"y_test"],
+        )
 
         classifier = convolutional_encoder_model(x_train.shape[1], x_train.shape[2], self.num_classes)
 

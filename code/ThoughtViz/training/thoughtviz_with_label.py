@@ -9,12 +9,13 @@ from keras.utils import to_categorical
 import utils.data_input_util as inutil
 from training.models.thoughtviz import *
 from utils.image_utils import *
+from utils import thoughtviz_paths as tv_paths
 
 
 def train_gan(dataset, input_noise_dim, batch_size, epochs, model_save_dir, output_dir, classifier_model_file):
 
     # folders containing images used for training
-    char_fonts_folders = ["./images/Char-Font"]
+    char_fonts_folders = [tv_paths.training_images("Char-Font")]
     num_classes = 10
 
     # load data and compile discriminator, generator models depending on the dataaset
@@ -98,15 +99,25 @@ def train():
     batch_size = 100
     run_id = 1
     epochs = 500
-    model_save_dir = os.path.join('./saved_models/thoughtviz_with_label/', folder_name_mapping[dataset], 'run_' + str(run_id))
+    subset = folder_name_mapping[dataset].lower()
+    classifier_model_file = tv_paths.trained_image_classifier(subset)
+    tv_paths.validate_label_gan_prereqs(
+        dataset,
+        char_font_dir=tv_paths.training_images("Char-Font"),
+        classifier_h5=classifier_model_file,
+    )
+
+    model_save_dir = tv_paths.saved_models(
+        'thoughtviz_with_label', folder_name_mapping[dataset], 'run_' + str(run_id)
+    )
     if not os.path.exists(model_save_dir):
         os.makedirs(model_save_dir)
 
-    output_dir = os.path.join('./outputs/thoughtviz_with_label/', folder_name_mapping[dataset], 'run_' + str(run_id))
+    output_dir = tv_paths.outputs_dir(
+        'thoughtviz_with_label', folder_name_mapping[dataset], 'run_' + str(run_id)
+    )
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-
-    classifier_model_file = os.path.join('./trained_classifier_models', 'classifier_' + folder_name_mapping[dataset].lower() + '.h5')
 
     train_gan(dataset=dataset, input_noise_dim=100, batch_size=batch_size, epochs=epochs, model_save_dir=model_save_dir, output_dir=output_dir, classifier_model_file=classifier_model_file)
 

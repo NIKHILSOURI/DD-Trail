@@ -54,14 +54,34 @@ class SegmentationModel:
     def __init__(self, config: BenchmarkConfig):
         self.config = config
         self._det_pipe = None
+        self._detector_name = "none_fallback"
         self._sam_processor = None
         self._sam_model = None
 
     def _load_detector(self) -> None:
         if self._det_pipe is not None:
             return
-        from transformers import pipeline
-        self._det_pipe = pipeline("zero-shot-object-detection", model=self.config.grounding_dino_model_id)
+        try:
+            from transformers import pipeline
+            self._det_pipe = pipeline("zero-shot-object-detection", model=self.config.grounding_dino_model_id)
+            self._detector_name = self.config.grounding_dino_model_id
+        except Exception as e:
+            log.warning("Grounding-DINO unavailable (%s). Trying fallback detector.", e)
+            try:
+                from transformers import pipeline
+                self._det_pipe = pipeline(
+                    "zero-shot-object-detection",
+                    model=self.config.grounding_dino_fallback_model_id,
+                )
+                self._detector_name = self.config.grounding_dino_fallback_model_id
+                log.warning("Using detector fallback: %s", self.config.grounding_dino_fallback_model_id)
+            except Exception as e2:
+                self._det_pipe = None
+                self._detector_name = "none_fallback"
+                log.warning(
+                    "Fallback detector unavailable (%s). Falling back to empty detections.",
+                    e2,
+                )
 
     def _load_sam(self) -> None:
         if self._sam_model is not None:
@@ -91,7 +111,10 @@ class SegmentationModel:
             "person", "dog", "cat", "car", "bus", "truck", "bicycle", "motorcycle",
             "tree", "flower", "chair", "table", "phone", "watch", "wallet", "apple", "tiger", "scooter",
         ]
-        det = self._det_pipe(pil, candidate_labels=labels, threshold=0.2)
+        if self._det_pipe is None:
+            det = []
+        else:
+            det = self._det_pipe(pil, candidate_labels=labels, threshold=0.2)
         inst: List[InstanceRecord] = []
         overlay = pil.copy()
         draw = ImageDraw.Draw(overlay)
@@ -132,4 +155,5 @@ class SegmentationModel:
             "labels_norm": sorted(list({x.label_norm for x in inst})),
             "overlay_path": str(overlay_path),
             "sam_backend": "sam" if self._sam_model is not None else "bbox_fallback",
+            "detector_backend": self._detector_name,
         }

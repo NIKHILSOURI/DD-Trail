@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 
 from .benchmark_config import BenchmarkConfig
+from .progress_util import tqdm
 from .segmentation_metrics import compare_instances
 from .segmentation_model import SegmentationModel
 from .utils import ensure_dir, save_json, setup_logger
@@ -27,9 +28,15 @@ def _sample_dirs(output_dir: Path, dataset_name: str) -> List[Path]:
 
 
 def run_segmentation_eval(output_dir: Path, dataset_name: str, config: BenchmarkConfig) -> Dict[str, Any]:
+    log.info("Initializing segmentation models (first run may download checkpoints) …")
     seg = SegmentationModel(config)
     rows: List[Dict[str, Any]] = []
-    for sdir in _sample_dirs(output_dir, dataset_name):
+    sample_dirs = _sample_dirs(output_dir, dataset_name)
+    sp = getattr(config, "show_progress", True)
+    s_iter = sample_dirs
+    if sp and sample_dirs:
+        s_iter = tqdm(sample_dirs, desc="Segmentation eval (%s)" % dataset_name, unit="sample")
+    for sdir in s_iter:
         root = sdir / "segmentation"
         ensure_dir(root)
         p = {

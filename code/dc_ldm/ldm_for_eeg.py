@@ -771,9 +771,16 @@ class eLDM:
                     latent = torch.as_tensor(latent, dtype=torch.float32, device=self.device)
                 else:
                     latent = latent.to(self.device)
+                if latent.dim() == 3 and latent.shape[0] == 1:
+                    latent = latent.squeeze(0)
+                while latent.dim() > 2 and latent.shape[-1] == 1:
+                    latent = latent.squeeze(-1)
                 gt_image = rearrange(item['image'], 'h w c -> 1 c h w')  # h w c
                 if isinstance(gt_image, np.ndarray):
                     gt_image = torch.from_numpy(gt_image).float().to(self.device)
+                # Benchmark / raw PIL paths often pass [0,1]; training uses [-1,1]
+                if float(gt_image.max()) <= 1.0 and float(gt_image.min()) >= 0.0:
+                    gt_image = gt_image * 2.0 - 1.0
                 pbar.set_postfix_str(f'item {count+1}/{total_items}, {ddim_steps} steps')
                 # assert latent.shape[-1] == self.fmri_latent_dim, 'dim error'
                 latent_rep = repeat(latent, 'h w -> c h w', c=num_samples)
@@ -788,6 +795,13 @@ class eLDM:
                 x_samples_ddim = model.decode_first_stage(samples_ddim)
                 x_samples_ddim = torch.clamp((x_samples_ddim+1.0)/2.0, min=0.0, max=1.0)
                 gt_image = torch.clamp((gt_image+1.0)/2.0, min=0.0, max=1.0)
+                if gt_image.shape[-2:] != x_samples_ddim.shape[-2:]:
+                    gt_image = F.interpolate(
+                        gt_image,
+                        size=x_samples_ddim.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
                 
                 all_samples.append(torch.cat([gt_image, x_samples_ddim.detach().cpu()], dim=0)) # put groundtruth at first
                 if output_path is not None:
@@ -996,7 +1010,7 @@ class eLDM_eval:
 
     @torch.no_grad()
     def generate(self, fmri_embedding, num_samples, ddim_steps, HW=None, limit=None, state=None, output_path=None,
-                 cfg_scale=1.0, cfg_uncond='zeros'):
+                 cfg_scale=1.0, cfg_uncond='zeros', pbar_desc=None):
         # fmri_embedding: n, seq_len, embed_dim
         all_samples = []
         if HW is None:
@@ -1021,7 +1035,8 @@ class eLDM_eval:
         with model.ema_scope():
             model.eval()
             total_items = len(fmri_embedding) if limit is None else min(limit, len(fmri_embedding))
-            wrap = tqdm(enumerate(fmri_embedding), total=total_items, desc='Generate test',
+            _desc = pbar_desc if pbar_desc else 'Generate test'
+            wrap = tqdm(enumerate(fmri_embedding), total=total_items, desc=_desc,
                         unit='item', bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
             for count, item in wrap:
                 if limit is not None:
@@ -1032,10 +1047,17 @@ class eLDM_eval:
                     latent = torch.as_tensor(latent, dtype=torch.float32, device=self.device)
                 else:
                     latent = latent.to(self.device)
+                # Benchmark / callers may pass (1, H, W); einops repeat expects 2D (H, W).
+                if latent.dim() == 3 and latent.shape[0] == 1:
+                    latent = latent.squeeze(0)
+                while latent.dim() > 2 and latent.shape[-1] == 1:
+                    latent = latent.squeeze(-1)
                 gt_image = rearrange(item['image'], 'h w c -> 1 c h w')  # h w c
                 if isinstance(gt_image, np.ndarray):
                     gt_image = torch.from_numpy(gt_image).float().to(self.device)
-                wrap.set_description(f'Generate test (item {count+1}/{total_items}, {ddim_steps} steps)')
+                if float(gt_image.max()) <= 1.0 and float(gt_image.min()) >= 0.0:
+                    gt_image = gt_image * 2.0 - 1.0
+                wrap.set_description(f'{_desc} (item {count+1}/{total_items}, {ddim_steps} PLMS steps)')
                 latent_rep = repeat(latent, 'h w -> c h w', c=num_samples)
                 c, re_latent = model.get_learned_conditioning(latent_rep)
                 # CFG: unconditional conditioning tensor [B,77,768] for PLMS torch.cat([uc, c])
@@ -1058,6 +1080,13 @@ class eLDM_eval:
                 x_samples_ddim = model.decode_first_stage(samples_ddim)
                 x_samples_ddim = torch.clamp((x_samples_ddim+1.0)/2.0, min=0.0, max=1.0)
                 gt_image = torch.clamp((gt_image+1.0)/2.0, min=0.0, max=1.0)
+                if gt_image.shape[-2:] != x_samples_ddim.shape[-2:]:
+                    gt_image = F.interpolate(
+                        gt_image,
+                        size=x_samples_ddim.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
                 
                 all_samples.append(torch.cat([gt_image, x_samples_ddim.detach().cpu()], dim=0)) # put groundtruth at first
                 if output_path is not None:

@@ -7,17 +7,18 @@ from PIL import Image
 from keras.models import load_model
 from keras.optimizers import SGD, Adam
 from keras.utils import to_categorical
-import pickle
 import utils.data_input_util as inutil
 from training.models.deligan import *
 from utils.image_utils import *
+from utils import thoughtviz_paths as tv_paths
+from utils.pickle_compat import load_pickle_compat
 
 
 def train_gan(dataset, input_noise_dim, batch_size, epochs, data_dir, saved_classifier_model_file, model_save_dir, output_dir):
 
     K.set_learning_phase(False)
     # folders containing images used for training
-    char_fonts_folders = ["./images/Char-Font"]
+    char_fonts_folders = [tv_paths.training_images("Char-Font")]
     num_classes = 10
 
     feature_encoding_dim = 100
@@ -49,7 +50,7 @@ def train_gan(dataset, input_noise_dim, batch_size, epochs, data_dir, saved_clas
     g.summary()
     d.summary()
     
-    splits = pickle.load(open(os.path.join(data_dir, 'data.pkl'), "rb"))
+    splits = load_pickle_compat(os.path.join(data_dir, "data.pkl"))
     classifier = load_model(saved_classifier_model_file)
     classifier.summary()
     x_test = splits[b'x_test']
@@ -123,16 +124,28 @@ def train():
     batch_size = 100
     run_id = 2
     epochs = 100
-    model_save_dir = os.path.join('./saved_models/baseline_deligan_with_eeg/', folder_name_mapping[dataset], 'run_' + str(run_id))
+    subset = folder_name_mapping[dataset].lower()
+    eeg_data_dir = tv_paths.data_eeg(subset)
+    eeg_classifier_model_file = tv_paths.eeg_classifier_model(subset)
+    tv_paths.validate_eeg_gan_prereqs(
+        dataset,
+        char_font_dir=tv_paths.training_images("Char-Font"),
+        classifier_h5=None,
+        eeg_data_dir=eeg_data_dir,
+        eeg_classifier_h5=eeg_classifier_model_file,
+    )
+
+    model_save_dir = tv_paths.saved_models(
+        'baseline_deligan_with_eeg', folder_name_mapping[dataset], 'run_' + str(run_id)
+    )
     if not os.path.exists(model_save_dir):
         os.makedirs(model_save_dir)
 
-    output_dir = os.path.join('./outputs/baseline_deligan_with_eeg/', folder_name_mapping[dataset], 'run_' + str(run_id))
+    output_dir = tv_paths.outputs_dir(
+        'baseline_deligan_with_eeg', folder_name_mapping[dataset], 'run_' + str(run_id)
+    )
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-
-    eeg_data_dir = os.path.join('../data/eeg/', folder_name_mapping[dataset].lower())
-    eeg_classifier_model_file = os.path.join('../models/eeg_models', folder_name_mapping[dataset].lower(), 'run_final.h5')
 
     train_gan(dataset=dataset, input_noise_dim=100, batch_size=batch_size, epochs=epochs, data_dir=eeg_data_dir, saved_classifier_model_file=eeg_classifier_model_file, model_save_dir=model_save_dir, output_dir=output_dir)
 
