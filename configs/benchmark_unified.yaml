@@ -1,0 +1,35 @@
+seed: 2022
+max_samples: null
+ddim_steps: 250
+num_samples_per_item: 1
+show_progress: true
+dataset: both
+models:
+- thoughtviz
+#- dreamdiffusion
+#- sarhm
+paths:
+  # repo_root: absolute path on this machine (Linux workspace).
+  repo_root: /workspace/DD-Trail
+  imagenet_path: /workspace/DD-Trail/datasets/imageNet_images
+  eeg_signals_path: /workspace/DD-Trail/datasets/eeg_5_95_std.pth
+  splits_path: /workspace/DD-Trail/datasets/block_splits_by_image_single.pth
+  thoughtviz_data_dir: /workspace/DD-Trail/code/ThoughtViz/data
+  thoughtviz_image_dir: /workspace/DD-Trail/code/ThoughtViz/training/images
+  # DreamDiffusion / SAR-HM: oldest vs newest generation run dirs on disk.
+  baseline_ckpt: /workspace/DD-Trail/exps/results/generation/21-03-2026-10-40-21/checkpoint_best.pth
+  sarhm_ckpt: /workspace/DD-Trail/exps/results/generation/22-03-2026-00-42-46/checkpoint_best.pth
+  sarhm_proto: /workspace/DD-Trail/exps/results/generation/22-03-2026-00-42-46/prototypes.pt
+  # ThoughtViz for imagenet_eeg: image-domain EEG encoder + image GAN (not char/digit).
+  thoughtviz_eeg_model_path: /workspace/DD-Trail/code/ThoughtViz/models/eeg_models/image/run_final.h5
+  # SavedModel dir for the image GAN (see code/ThoughtViz/README.md). Do not point this at .../Char/... for ImageNet-EEG.
+  thoughtviz_gan_model_path: /workspace/DD-Trail/code/ThoughtViz/models/gan_models/final/image/generator.model
+output:
+  root: /workspace/DD-Trail/results/benchmark_unified
+  run_name: thesis_unified
+  clean_before_run: false
+evaluation:
+  summary_enabled: true
+  segmentation_enabled: true
+  strict_eval: false
+  thoughtviz_strict_checkpoint_match: false

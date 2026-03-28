@@ -1,0 +1,55 @@
+# Unified benchmark environment for DreamDiffusion + SAR-HM + ThoughtViz + metrics.
+# Python 3.11 recommended.
+#
+# Install torch first for your CUDA stack, then:
+#   pip install -r requirements_unified.txt
+#
+# NOTE:
+# - This file is conservative and keeps broad ranges already used in the repo.
+# - ThoughtViz uses legacy Keras APIs; keep tensorflow/keras on 2.13 line.
+
+setuptools==68.0.0
+# Single-venv compatibility mode:
+# TensorFlow 2.13 requires typing_extensions<4.6.0, so torch must stay on a pre-TypeIs line.
+typing_extensions>=4.5.0,<4.6.0
+
+# Core DL
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
+tensorflow==2.13.1
+keras==2.13.1
+
+# Numerical/data
+numpy>=1.24.0,<2.0.0
+scipy>=1.10.0,<2.0.0
+pandas>=2.0.0,<3.0.0
+scikit-learn>=1.3.0,<2.0.0
+scikit-image>=0.21.0,<1.0.0
+matplotlib>=3.7.0,<4.0.0
+Pillow>=10.0.0,<11.0.0
+opencv-python>=4.8.0,<5.0.0
+
+# Model/runtime utilities
+pytorch-lightning>=2.0.5,<2.1.0
+torchmetrics>=0.11.0,<1.0.0
+kornia>=0.7.0,<1.0.0
+timm>=0.9.0,<1.0.0
+einops>=0.6.1,<1.0.0
+omegaconf>=2.3.0,<3.0.0
+pyyaml>=6.0,<7.0.0
+tqdm>=4.65.0,<5.0.0
+natsort>=8.0.0,<9.0.0
+
+# Text/image metrics + caption/segmentation stack
+transformers==4.38.2
+accelerate>=0.20.0,<2.0.0
+safetensors>=0.4.0
+sentence-transformers==2.6.1
+
+# Optional logging/perceptual metrics already used in project
+wandb>=0.15.0,<1.0.0
+torch-fidelity>=0.3.0,<1.0.0
+lpips>=0.1.4,<1.0.0
+h5py>=3.7.0
+protobuf>=3.20.3,<5.0.0

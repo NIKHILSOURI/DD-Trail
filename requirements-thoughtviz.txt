@@ -1,0 +1,49 @@
+# ThoughtViz — TensorFlow / Keras 2 (legacy API)
+# ---------------------------------------------------------------------------
+# NEVER install this file into the main PyTorch `venv`.
+#
+# TensorFlow 2.13 forces typing_extensions<4.6 (e.g. 4.5.0). PyTorch 2.7+ requires
+# typing_extensions>=4.10 (TypeIs) — you will get: ImportError: cannot import name 'TypeIs'.
+# TF also downgrades numpy; requirements-thoughtviz-gpu.txt can replace nvidia-cudnn-cu11
+# and break the torch CUDA stack.
+#
+# If you already polluted the main venv:  bash scripts/repair_pytorch_venv.sh
+#
+# Use a SEPARATE venv from the main DreamDiffusion PyTorch stack, e.g.:
+#   python3 -m venv venv_thoughtviz
+#   source venv_thoughtviz/bin/activate
+#   pip install -r requirements-thoughtviz.txt
+#
+# IMPORTANT — do NOT run `pip install -e ./code` in this venv. That installs the
+# `dreamdiffusion` package, which pulls torch/timm/tqdm and will conflict with
+# TensorFlow and trigger pip warnings like:
+#   dreamdiffusion 0.0.1 requires timm/torch/tqdm, which is not installed
+# If you already did that here, remove it:
+#   pip uninstall dreamdiffusion -y
+#
+# Python: 3.10 or 3.11 recommended (TensorFlow 2.13 wheels; avoid mixing with
+# a PyTorch env that already pins numpy/torch in conflicting ways).
+#
+# These pins match the legacy imports in code/ThoughtViz (standalone `keras`,
+# keras.engine.topology / convolutional layers, Adam(lr=...), etc.).
+# ---------------------------------------------------------------------------
+
+tensorflow==2.13.1
+keras==2.13.1
+
+# Supporting libs (used by ThoughtViz scripts)
+numpy>=1.23.0,<2.0.0
+Pillow>=9.0.0
+scikit-learn>=1.0.0
+six>=1.16.0
+h5py>=3.7.0
+tqdm>=4.65.0  # benchmark.compare_all_models (step 2 ThoughtViz-only merge)
+
+# TensorFlow / protobuf compatibility
+protobuf>=3.20.3,<5.0.0
+
+# TF 2.13.x requires this range; torch/transformers (benchmark extras) may upgrade it — reinstall if pip warns.
+typing-extensions>=3.6.6,<4.6.0
+
+# --- GPU (optional): see requirements-thoughtviz-gpu.txt and code/ThoughtViz/thoughtviz_gpu_env.sh
+# TensorFlow 2.13 needs CUDA 11.x *runtime* libs via pip + LD_LIBRARY_PATH, not only nvidia-smi.

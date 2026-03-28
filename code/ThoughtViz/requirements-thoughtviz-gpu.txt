@@ -1,0 +1,21 @@
+# Optional: CUDA 11.x libraries (pip) so TensorFlow 2.13 can use the GPU.
+# Install AFTER requirements-thoughtviz.txt:
+#   pip install -r requirements-thoughtviz-gpu.txt
+#
+# Then (same shell):
+#   source code/ThoughtViz/thoughtviz_gpu_env.sh
+#
+# TensorFlow needs several NVIDIA shared libs, not only cudart/cudnn/cublas.
+#
+# Windows: PyPI does not ship nvidia-cudnn-cu11==8.6.0.163 for win_amd64; use the
+# 8.9.x line below (same file works on Linux and Windows for typical TF 2.13 installs).
+# If GPU still fails at runtime, use WSL2+Linux CUDA or align DLLs with NVIDIA’s TF table.
+
+nvidia-cuda-runtime-cu11==11.8.89
+nvidia-cudnn-cu11==8.9.4.25
+nvidia-cublas-cu11==11.11.3.6
+nvidia-cuda-nvrtc-cu11==11.8.89
+nvidia-cusolver-cu11==11.4.1.48
+nvidia-cufft-cu11==10.9.0.58
+nvidia-curand-cu11==10.3.0.86
+nvidia-cusparse-cu11==11.7.5.86

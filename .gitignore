@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# Data and checkpoints (large; don't push)
+datasets/
+pretrains/
+*.pth
+exps/
+results/
+runs/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# ThoughtViz / local training artifacts (large)
+code/ThoughtViz/outputs/
+code/ThoughtViz/saved_models/
+# EEG pickles are ~170–180MB each — exceeds GitHub 100MB limit; download separately (see ThoughtViz README)
+code/ThoughtViz/data/
+venv_thoughtviz*/
+venv_thoughtviz_gpu/

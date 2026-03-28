@@ -1,0 +1,21 @@
+# Extra deps for: benchmark.compare_all_models in venv_thoughtviz with --dataset both
+# (ImageNet-EEG .pth uses torch.load; no transformers/CLIP required for our benchmark loader.)
+#
+# Summary/segmentation eval (--summary_enabled true) needs Hugging Face stack:
+#   pip install -r requirements-thoughtviz.txt
+#   pip install -r requirements-thoughtviz-benchmark.txt
+#
+# TensorFlow GPU: nvidia-smi only proves the driver; TF 2.13 still needs CUDA 11.x
+# pip libs + LD_LIBRARY_PATH — see requirements-thoughtviz-gpu.txt and
+# code/ThoughtViz/thoughtviz_gpu_env.sh
+#
+--extra-index-url https://download.pytorch.org/whl/cpu
+# Pin torch 2.1.x: newer torch declares typing-extensions>=4.10, which conflicts with TensorFlow 2.13 (<4.6).
+torch==2.1.2
+transformers>=4.35.0,<5
+accelerate>=0.20.0
+safetensors>=0.4.0
+sentence-transformers>=2.6.0
+
+# After torch/transformers, pip may install typing-extensions>=4.6; TensorFlow 2.13 needs <4.6 — force compatible pin:
+typing-extensions>=3.6.6,<4.6.0
