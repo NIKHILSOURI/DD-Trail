@@ -1,0 +1,27 @@
+# Standalone env for EEG2Image (TensorFlow) — do NOT install into PyTorch venv.
+# Create: py -3 -m venv venv_eeg2image && .\venv_eeg2image\Scripts\activate
+# pip install -r requirements-eeg2image.txt
+#
+# Pins are loose; align with EEG2Image anaconda/ if restore fails across TF versions.
+# TensorFlow Addons officially supports TF <2.15; TF 2.15+ logs a compatibility warning
+# (SpectralNormalization in DCGAN still needs TFA). Prefer ``tensorflow>=2.12,<2.15`` for a quiet matrix.
+
+tensorflow>=2.11,<2.16
+tensorflow-addons>=0.22,<0.25
+numpy>=1.23,<2.0
+# Step 5 (run_eeg2image_imagenet_subset.py): ``eeg_5_95_std.pth`` / splits use torch.load. CPU-only is enough:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0,<3.0
+opencv-python-headless>=4.8.0
+tqdm>=4.65.0
+Pillow>=9.0.0
+scikit-image>=0.21.0
+tifffile>=2023.1.0
+matplotlib>=3.7.0
+scikit-learn>=1.3.0
+seaborn>=0.12.0
+pandas>=2.0.0
+natsort>=8.0.0
+# Optional; used by upstream utils.py if you import full data pipeline:
+tensorflow-io>=0.34.0; platform_system != "Windows"
+# tensorflow-io Windows wheels may be unavailable for some TF/Python combos — install manually if needed.

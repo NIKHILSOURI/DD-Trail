@@ -1,0 +1,9 @@
+{
+  "dataset_mode": "imagenet_eeg",
+  "run_id": "imagenet_eeg",
+  "eeg_compat": "auto",
+  "thoughtviz_pkl": "../data/b2i_data/eeg/image/data.pkl",
+  "imagenet_export_pkl": "D:/STUDY/BTH/THESIS/NEW_DREAM/DD-Trail/results/eeg2image_export_ie/data.pkl",
+  "n_classes": 40,
+  "joint_train_strategy": "concat"
+}

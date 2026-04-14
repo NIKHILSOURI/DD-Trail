@@ -1,0 +1,12 @@
+{
+  "dataset_mode": "imagenet_eeg",
+  "run_id": "imagenet_eeg",
+  "eeg_compat": "auto",
+  "thoughtviz_pkl": "../data/b2i_data/eeg/image/data.pkl",
+  "b2i_images_train_root": "../data/b2i_data/images/train",
+  "imagenet_export_pkl": "D:/STUDY/BTH/THESIS/NEW_DREAM/DD-Trail/results/eeg2image_export_ie/data.pkl",
+  "imagenet_export_metadata": "D:/STUDY/BTH/THESIS/NEW_DREAM/DD-Trail/results/eeg2image_export_ie/export_metadata.json",
+  "imagenet_root": "D:/STUDY/BTH/THESIS/NEW_DREAM/DD-Trail/datasets/imageNet_images",
+  "n_classes": 40,
+  "joint_train_strategy": "concat"
+}

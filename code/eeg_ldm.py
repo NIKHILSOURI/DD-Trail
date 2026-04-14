@@ -2,13 +2,15 @@ import os, sys
 # Reduce TensorFlow log noise (e.g. from wandb or deps that load TF)
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
-# Reduce CUDA fragmentation on 16 GB GPUs (avoids OOM during backward)
-if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+# Reduce CUDA fragmentation on Linux (Windows CUDA build does not support expandable_segments)
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ and os.name != "nt":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import warnings
 warnings.filterwarnings("ignore", message=".*pretrained.*deprecated.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*Arguments other than a weight enum.*", category=UserWarning)
+# Lightning / setuptools (lightning_fabric imports pkg_resources)
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*", category=UserWarning)
 # Lightning / PyTorch deprecation and logger warnings (Stage B runs correctly)
 warnings.filterwarnings("ignore", message=".*GradScaler.*deprecated.*", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*tensorboardX.*", category=UserWarning)
@@ -20,7 +22,10 @@ import numpy as np
 import torch
 import argparse
 import datetime
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None  # optional; pip install wandb or use full requirements.txt
 import torchvision.transforms as transforms
 from einops import rearrange
 from PIL import Image
@@ -32,7 +37,7 @@ from tqdm import tqdm
 
 # own code
 from config import Config_Generative_Model
-from dataset import  create_EEG_dataset
+from dataset import create_EEG_dataset, build_stage_b_datasets
 from dc_ldm.ldm_for_eeg import eLDM
 from eval_metrics import get_similarity_metric
 from utils.state_dict_utils import filter_state_dict_for_model, log_filter_info, is_mae_pretrain_ckpt
@@ -259,7 +264,8 @@ def wandb_init(config, output_path):
     create_readme(config, output_path)
 
 def wandb_finish():
-    wandb.finish()
+    if wandb is not None:
+        wandb.finish()
 
 def to_image(img):
     if img.shape[-1] != 3:
@@ -531,9 +537,12 @@ def main(config):
             )
         if not os.path.isdir(imagenet_path):
             raise RuntimeError("imagenet_path is not a directory: %s" % os.path.abspath(imagenet_path))
-        eeg_latents_dataset_train, eeg_latents_dataset_test = create_EEG_dataset(eeg_signals_path = config.eeg_signals_path, splits_path = config.splits_path,
-                imagenet_path=imagenet_path,
-                image_transform=[img_transform_train, img_transform_test], subject = getattr(config, 'subject', 4))
+        eeg_latents_dataset_train, eeg_latents_dataset_test = build_stage_b_datasets(
+            config,
+            img_transform_train,
+            img_transform_test,
+            subject=getattr(config, 'subject', 4),
+        )
         # eeg_latents_dataset_train, eeg_latents_dataset_test = create_EEG_dataset_viz( image_transform=[img_transform_train, img_transform_test])
         if len(eeg_latents_dataset_train) == 0:
             raise RuntimeError("Training split is empty after filtering. Check splits_path and eeg_signals_path, or relax Splitter filter (e.g. EEG length 450–600).")
@@ -746,10 +755,10 @@ def main(config):
                 config.batch_size, config.lr, config.output_path, config=config)
 
     pbar.update(1)
-    pbar.set_description('Generate & evaluate')
+    pbar.set_description('Post-train (optional gen)')
     # Skip post-training image generation when disabled (same flag as val; Stage C does full-quality gen)
     if getattr(config, 'skip_post_train_generation', True):
-        print('Stage B: skipping post-training image generation (skip_post_train_generation=True). Run Stage C for full-quality generation.\n')
+        print('Stage B: skipping post-training image generation and summary metrics (skip_post_train_generation=True). Use Stage C for full gen/metrics.\n')
     elif getattr(config, 'disable_image_generation_in_val', False):
         print('Stage B: skipping post-training image generation (disable_image_generation_in_val=True). Run Stage C for full-quality generation.\n')
     else:
@@ -852,6 +861,14 @@ def get_args_parser():
     parser.add_argument('--limit_val_items', type=int, default=0, help='Mini mode: use only first N val/test samples (0=no limit). Deterministic Subset(range(N)).')
     parser.add_argument('--skip_post_train_generation', type=str, default='true', choices=['true', 'false'], help='If true, skip post-training image generation (Stage C for full gen). Default true for mini runs.')
     parser.add_argument('--imagenet_path', type=str, default=None, help='ImageNet root for EEG GT images (required for dataset=EEG). Set or use env IMAGENET_PATH.')
+    parser.add_argument('--eeg_dataset_name', type=str, default=None, choices=['imagenet_eeg', 'thoughtviz'], help='Which EEG dataset layout to use (default from config).')
+    parser.add_argument('--thoughtviz_eeg_path', type=str, default=None, help='ThoughtViz .pth (same schema as ImageNet-EEG).')
+    parser.add_argument('--thoughtviz_images_root', type=str, default=None, help='Root folder for ThoughtViz image paths.')
+    parser.add_argument('--use_quasi_stationary_windows', type=str, default=None, choices=['true', 'false'], help='Temporal QS windowing before encoder (default false).')
+    parser.add_argument('--use_domain_aware_sarhm', type=str, default=None, choices=['true', 'false'], help='Separate SAR-HM prototype banks per domain.')
+    parser.add_argument('--proto_path_imagenet_eeg', type=str, default=None, help='Prototypes for imagenet_eeg domain.')
+    parser.add_argument('--proto_path_thoughtviz', type=str, default=None, help='Prototypes for thoughtviz domain.')
+    parser.add_argument('--lambda_contrast', type=float, default=None, help='InfoNCE weight (0=off).')
     # # distributed training parameters
     # parser.add_argument('--local_rank', type=int)
 
@@ -889,6 +906,22 @@ def update_config(args, config):
             config.debug_sampling_steps = [int(x.strip()) for x in args.debug_sampling_steps.split(',') if x.strip()]
         except Exception:
             config.debug_sampling_steps = None
+    if getattr(args, 'eeg_dataset_name', None) is not None:
+        config.eeg_dataset_name = args.eeg_dataset_name
+    if getattr(args, 'thoughtviz_eeg_path', None) is not None:
+        config.thoughtviz_eeg_path = args.thoughtviz_eeg_path
+    if getattr(args, 'thoughtviz_images_root', None) is not None:
+        config.thoughtviz_images_root = args.thoughtviz_images_root
+    if getattr(args, 'use_quasi_stationary_windows', None) is not None:
+        config.use_quasi_stationary_windows = (args.use_quasi_stationary_windows == 'true')
+    if getattr(args, 'use_domain_aware_sarhm', None) is not None:
+        config.use_domain_aware_sarhm = (args.use_domain_aware_sarhm == 'true')
+    if getattr(args, 'proto_path_imagenet_eeg', None) is not None:
+        config.proto_path_imagenet_eeg = args.proto_path_imagenet_eeg
+    if getattr(args, 'proto_path_thoughtviz', None) is not None:
+        config.proto_path_thoughtviz = args.proto_path_thoughtviz
+    if getattr(args, 'lambda_contrast', None) is not None:
+        config.lambda_contrast = args.lambda_contrast
     # Normalize CLI bools
     if hasattr(args, 'disable_image_generation_in_val') and args.disable_image_generation_in_val is not None:
         config.disable_image_generation_in_val = (args.disable_image_generation_in_val == 'true')

@@ -21,7 +21,7 @@ DreamDiffusion is an **EEG-conditioned** variant of Stable Diffusion that recons
   - [Stage C: EEG-to-Image Generation & Evaluation](#stage-c-eeg-to-image-generation--evaluation)
   - [Compare-Eval: Baseline vs SAR-HM vs SAR-HM++](#compare-eval-baseline-vs-sar-hm-vs-sar-hm)
   - [Graphs: Thesis-Quality Plots](#graphs-thesis-quality-plots)
-- [Unified Benchmark (ThoughtViz, DreamDiffusion, SAR-HM)](#unified-benchmark-thoughtviz-dreamdiffusion-sar-hm)
+- [Unified Benchmark (EEG2Image, DreamDiffusion, SAR-HM)](#unified-benchmark-eeg2image-dreamdiffusion-sar-hm)
 - [Results (Thesis Runs)](#results-thesis-runs)
 - [Repository Structure](#repository-structure)
 - [Data & Pretrained Weights](#data--pretrained-weights)
@@ -42,7 +42,7 @@ DreamDiffusion is an **EEG-conditioned** variant of Stable Diffusion that recons
   - **SAR-HM++**: multi-level semantic prototypes + semantic query → top-k retrieval → adapter → confidence-gated fusion; optional **semantic targets in batch** (z_sem_gt, clip_img_embed_gt, summary_embed_gt) and **CLIP losses on decoded generated images** (L_clip_img, L_clip_text) for better semantic fidelity
 - **Stage C**: Generate images from EEG and compute metrics using saved checkpoints. **Inference is EEG-only** (no GT semantic leakage).
 - **Compare-eval + graphs**: Create **final tables/figures** from existing outputs; supports baseline vs SAR-HM vs SAR-HM++ (no retraining).
-- **Unified Benchmark**: Fair comparison of **ThoughtViz**, **DreamDiffusion baseline**, and **DreamDiffusion + SAR-HM** on **ImageNet-EEG** and **ThoughtViz** datasets. Single sanity test, small (10–20 sample) runs, metrics, tables, and qualitative panels. See [Unified Benchmark](#unified-benchmark-thoughtviz-dreamdiffusion-sar-hm) and `docs/commands.md`, `docs/benchmark_workflow.md`. *This benchmark uses only normal SAR-HM; SAR-HM++ is separate (future work).*
+- **Unified Benchmark**: Fair comparison of **EEG2Image** (TensorFlow baseline), **DreamDiffusion baseline**, and **DreamDiffusion + SAR-HM** on **ImageNet-EEG** and the **ThoughtViz dataset** (pickle + class images; dataset name `thoughtviz`). Single sanity test, small runs, metrics, tables, and qualitative panels. See [Unified Benchmark](#unified-benchmark-eeg2image-dreamdiffusion-sar-hm), `docs/EEG2Image_integration.md`, and `docs/benchmark_workflow.md`. *EEG2Image is a standalone baseline, not part of the diffusion training code. SAR-HM++ is separate (future work).*
 
 ---
 
@@ -105,6 +105,8 @@ Stage B is run via:
 
 - `python code/eeg_ldm.py ...`
 
+**Training-only (recommended, lower GPU load):** pass `--disable_image_generation_in_val true`, `--val_image_gen_every_n_epoch 0`, and `--skip_post_train_generation true` so Stage B skips validation sampling and post-training image grids/metrics; use **Stage C** below for generation. These match the defaults in `code/config.py`.
+
 This produces:
 
 - `results/runs/<timestamp>_<mode>_<seed>/` (configs + `train_log.csv`)
@@ -128,7 +130,10 @@ python code/eeg_ldm.py \
   --seed 2022 \
   --eval_every 2 \
   --num_eval_samples 50 \
-  --use_sarhm false
+  --use_sarhm false \
+  --disable_image_generation_in_val true \
+  --val_image_gen_every_n_epoch 0 \
+  --skip_post_train_generation true
 ```
 
 #### SAR-HM (full_sarhm, thesis-level)
@@ -144,7 +149,10 @@ python code/eeg_ldm.py \
   --seed 2022 \
   --eval_every 2 \
   --num_eval_samples 50 \
-  --ablation_mode full_sarhm
+  --ablation_mode full_sarhm \
+  --disable_image_generation_in_val true \
+  --val_image_gen_every_n_epoch 0 \
+  --skip_post_train_generation true
 ```
 
 #### SAR-HM++ (multi-level semantic retrieval + semantic teacher losses)
@@ -175,7 +183,10 @@ python code/eeg_ldm.py \
   --eeg_signals_path datasets/eeg_5_95_std.pth \
   --num_epoch 500 \
   --batch_size 16 \
-  --seed 2022
+  --seed 2022 \
+  --disable_image_generation_in_val true \
+  --val_image_gen_every_n_epoch 0 \
+  --skip_post_train_generation true
 ```
 
 The train dataset is automatically wrapped with **SemanticTargetWrapper** when `use_sarhmpp` and `semantic_targets_path` are set; each batch then includes `z_sem_gt`, `clip_img_embed_gt`, `summary_embed_gt`, and `has_semantic_gt`. L_clip_img and L_clip_text are computed from **decoded generated images** (configurable via `clip_loss_every_n_steps`). Inference remains **EEG-only** (no GT semantics).
@@ -261,33 +272,33 @@ python tools/make_optional_graphs.py \
 
 ---
 
-## Unified Benchmark (ThoughtViz, DreamDiffusion, SAR-HM)
+## Unified Benchmark (EEG2Image, DreamDiffusion, SAR-HM)
 
-A **unified benchmark** allows fair comparison of three EEG-to-image models on two datasets. **Only normal SAR-HM** is used in this benchmark (no SAR-HM++; that is separate/future work).
+A **unified benchmark** compares three EEG-to-image approaches on two datasets. **EEG2Image** ([ICASSP 2023](https://github.com/prajwalsingh/EEG2Image)) is the official **TensorFlow** baseline (TripleNet + DCGAN, checkpoints under `third_party/EEG2Image/`). **Only normal SAR-HM** is used here (no SAR-HM++; separate/future work).
 
 ### Models and datasets
 
 | Models | Description |
 |--------|-------------|
-| **ThoughtViz** | GAN-based (official repo under `code/ThoughtViz/`); EEG classifier encoding + generator. |
+| **EEG2Image** | Official baseline: `eeg2image.png` from `benchmark.run_eeg2image_from_manifest` (TF subprocess). |
 | **DreamDiffusion baseline** | EEG → MAE → conditioning → Stable Diffusion 1.5. |
 | **DreamDiffusion + SAR-HM** | Same as baseline + Hopfield retrieval over class prototypes + confidence-gated fusion. |
 
 | Datasets | Description |
 |----------|-------------|
 | **ImageNet-EEG** | EEG signals + ImageNet GT images; splits from `block_splits_*.pth`. |
-| **ThoughtViz** | ThoughtViz data (`data.pkl` + images by class under `code/ThoughtViz/`). |
+| **thoughtviz** | ThoughtViz **dataset** only: `data/eeg/image/data.pkl` + `training/images/` (class-reference GT optional). |
 
 ### Benchmark layout
 
-- **Sanity test:** `python tests/test_full_pipeline_sanity.py` — checks dataset load, model load, one-sample inference, and metrics. Set `IMAGENET_PATH`, `BASELINE_CKPT`, `SARHM_CKPT`, `SARHM_PROTO` as needed.
-- **Small benchmark (10–20 samples):** `python -m benchmark.compare_all_models --dataset imagenet_eeg --max_samples 10 --run_name smoke_test --imagenet_path <path> --baseline_ckpt <path> --sarhm_ckpt <path> --sarhm_proto <path>`
-- **Outputs:** Standardized under `results/benchmark_outputs/<dataset>/sample_<id>/` with `ground_truth.png`, `thoughtviz.png`, `dreamdiffusion.png`, `sarhm.png`, and `metadata.json`. Optional: `results/experiments/<run_name>/` for metrics, timing, tables, and panels.
+- **Full pipeline (EEG2Image + eval):** `python -m benchmark.orchestrate_all --config configs/benchmark_unified.yaml` — pass `--eeg2image_python` to your TensorFlow venv (e.g. `third_party/eeg-venv/Scripts/python.exe`).
+- **DreamDiffusion/SAR-HM only (in-process):** `python -m benchmark.compare_all_models --dataset imagenet_eeg --max_samples 10 ...`
+- **Outputs:** `ground_truth.png`, `eeg2image.png`, `dreamdiffusion.png`, `sarhm.png`, `metadata.json` under `.../benchmark_outputs/<dataset>/sample_<id>/`.
 
 ### Documentation and commands
 
-- **Exact runnable commands:** `docs/commands.md` (sanity, small benchmark, ThoughtViz train/test, DreamDiffusion/SAR-HM, comparison, metrics, tables).
-- **ThoughtViz integration:** `docs/thoughtviz_integration.md` (wrapper API, data paths, dependencies).
+- **EEG2Image:** `docs/EEG2Image_integration.md` (replaces Keras ThoughtViz model; dataset + limitations).
+- **Exact runnable commands:** `docs/commands.md` (sanity, benchmark, DreamDiffusion/SAR-HM, comparison, metrics, tables).
 - **Benchmark workflow:** `docs/benchmark_workflow.md` (phases: sanity → small benchmark → multi-run → final comparison; folder structure; MSC/optional metrics).
 - **Inspection and plan:** `docs/BENCHMARK_INSPECTION_AND_PLAN.md` (implementation plan and file map).
 
@@ -403,12 +414,12 @@ High-level structure (key files only):
 │   ├── dataset.py                     # Dataset loading helpers
 │   ├── eval_metrics.py                # Metrics utilities
 │   ├── config.py                      # Main configuration (including SAR-HM flags)
-│   ├── thoughtviz_integration/        # ThoughtViz wrapper for unified benchmark
+│   ├── thoughtviz_integration/        # ThoughtViz **dataset** helpers for unified benchmark (EEG2Image baseline)
 │   │   ├── __init__.py                # get_thoughtviz_root
-│   │   ├── config.py                  # ThoughtVizConfig
-│   │   ├── dataset_adapter.py         # ThoughtVizDatasetAdapter, unified sample interface
-│   │   ├── model_wrapper.py           # ThoughtVizWrapper (load, generate_from_eeg, save_outputs)
-│   │   ├── inference.py               # Thin inference entry
+│   │   ├── config.py                  # ThoughtVizConfig (paths)
+│   │   ├── dataset_adapter.py         # unified sample interface from data.pkl
+│   │   ├── model_wrapper.py           # legacy Keras GAN (not used by orchestrator; EEG2Image is baseline)
+│   │   ├── inference.py               # legacy entry
 │   │   └── utils.py                   # Path resolution, availability check
 │   ├── sc_mbm/
 │   │   ├── mae_for_eeg.py
@@ -427,19 +438,20 @@ High-level structure (key files only):
 │   │   └── vis.py                     # Visualizations
 │   ├── build_semantic_targets.py      # Offline: build semantic_targets.pt from dataset images
 │   ├── build_semantic_prototypes.py   # Offline: build semantic_prototypes.pt from semantic_targets.pt
-│   ├── ThoughtViz/                   # (optional) official ThoughtViz repo clone for benchmark
+│   ├── ThoughtViz/                   # ThoughtViz **dataset** (data.pkl, training/images); not the Keras baseline
 │   └── dc_ldm/
 │       ├── ldm_for_eeg.py
 │       ├── utils.py
 │       ├── models/                    # adopted from LDM
 │       └── modules/                   # adopted from LDM
 │
-├── benchmark/                         # Unified benchmark (ThoughtViz, DreamDiffusion, SAR-HM)
+├── benchmark/                         # Unified benchmark (EEG2Image, DreamDiffusion, SAR-HM)
 │   ├── __init__.py
 │   ├── benchmark_config.py            # BenchmarkConfig
 │   ├── benchmark_runner.py            # run_one_model, run_all_models
 │   ├── dataset_registry.py            # get_dataset (imagenet_eeg, thoughtviz)
-│   ├── model_registry.py              # get_model, generate_dreamdiffusion, generate_thoughtviz
+│   ├── eeg2image_runner.py            # EEG2Image TF baseline (subprocess)
+│   ├── model_registry.py              # get_model, generate_dreamdiffusion (in-process)
 │   ├── output_standardizer.py         # Standardized outputs (ground_truth.png, model.png, metadata.json)
 │   ├── metrics_runner.py              # Core metrics (SSIM, PCC, CLIP)
 │   ├── timing_runner.py               # Inference timing
@@ -459,8 +471,8 @@ High-level structure (key files only):
 │   └── make_optional_graphs.py        # optional/advanced plots (ablations, std across seeds)
 │
 ├── docs/
-│   ├── commands.md                    # Runnable commands: sanity, small benchmark, ThoughtViz, DreamDiffusion, SAR-HM, comparison
-│   ├── thoughtviz_integration.md      # ThoughtViz wrapper, data paths, dependencies
+│   ├── commands.md                    # Runnable commands: sanity, benchmark, DreamDiffusion, SAR-HM, comparison
+│   ├── EEG2Image_integration.md       # EEG2Image baseline (replaces Keras ThoughtViz model)
 │   ├── benchmark_workflow.md          # Benchmark phases, folder structure, MSC/optional metrics
 │   ├── BENCHMARK_INSPECTION_AND_PLAN.md  # Benchmark implementation plan and file map
 │   ├── SARHM_README.md                # SAR-HM configuration + dataset policy
@@ -497,7 +509,7 @@ High-level structure (key files only):
 │   │       ├── checkpoint_best.pth
 │   │       ├── prototypes.pt          # SAR-HM only
 │   │       └── lightning_logs/...
-│   ├── benchmark_outputs/             # unified benchmark: ground_truth.png, thoughtviz.png, dreamdiffusion.png, sarhm.png
+│   ├── benchmark_outputs/             # unified: ground_truth.png, eeg2image.png, dreamdiffusion.png, sarhm.png
 │   │   └── <dataset>/sample_<id>/
 │   ├── experiments/                  # optional: run_001/, run_002/ (config, metrics, timing, tables)
 │   ├── eval/
@@ -539,7 +551,7 @@ Optional: ImageNet subset (for ImageNet-EEG) provided via Drive:
 
 > If you cannot access Drive from your environment, download locally and upload/mount into your compute instance.
 
-**Unified benchmark — ThoughtViz:** Place the official ThoughtViz repository under `code/ThoughtViz/` (or `codes/ThoughtViz/`). The benchmark uses its `data.pkl`, image folders, and model checkpoints; see `docs/thoughtviz_integration.md`.
+**Unified benchmark — ThoughtViz dataset + EEG2Image:** Keep `code/ThoughtViz/data/eeg/image/data.pkl` and class images under `code/ThoughtViz/training/images/` (see `configs/benchmark_unified.yaml`). Clone **EEG2Image** with checkpoints under `third_party/EEG2Image/` and pass `--eeg2image_python` to the TensorFlow venv when running `python -m benchmark.orchestrate_all`. See `docs/EEG2Image_integration.md`.
 
 ### Stable Diffusion 1.5
 

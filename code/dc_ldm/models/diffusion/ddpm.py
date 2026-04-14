@@ -455,6 +455,15 @@ class DDPM(pl.LightningModule):
                                     unit='item', bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'):
                 latent = item[0] # fmri embedding
                 gt_image = rearrange(item[1], 'h w c -> 1 c h w') # h w c
+                csm = getattr(model, 'cond_stage_model', None)
+                if csm is not None and hasattr(csm, 'set_batch_context') and isinstance(data, dict):
+                    ctx = {k: data[k] for k in ('domain_id', 'domain_key') if k in data}
+                    if 'domain_id' in data and isinstance(data['domain_id'], torch.Tensor) and data['domain_id'].dim() > 0:
+                        ctx['domain_id'] = data['domain_id'][count:count + 1]
+                    if 'domain_key' in data and isinstance(data['domain_key'], (list, tuple)) and len(data['domain_key']) > count:
+                        ctx['domain_key'] = data['domain_key'][count]
+                    if ctx:
+                        csm.set_batch_context(ctx)
                 # Optional: save intermediate decoded images at given steps for first item (noise debugging)
                 img_cb = None
                 if count == 0 and debug_steps_set and debug_save_dir:
@@ -469,20 +478,23 @@ class DDPM(pl.LightningModule):
                                 Image.fromarray(arr).save(
                                     os.path.join(debug_save_dir, 'step%d_sample%d.png' % (int(step), b)))
                     img_cb = _save_step
-                c, re_latent = model.get_learned_conditioning(repeat(latent, 'h w -> c h w', c=num_samples).to(self.device))
-                samples_ddim, _ = sampler.sample(S=ddim_steps, 
-                                                conditioning=c,
-                                                batch_size=num_samples,
-                                                shape=shape,
-                                                verbose=False,
-                                                generator=None,
-                                                img_callback=img_cb)
+                try:
+                    c, re_latent = model.get_learned_conditioning(repeat(latent, 'h w -> c h w', c=num_samples).to(self.device))
+                    samples_ddim, _ = sampler.sample(S=ddim_steps, 
+                                                    conditioning=c,
+                                                    batch_size=num_samples,
+                                                    shape=shape,
+                                                    verbose=False,
+                                                    generator=None,
+                                                    img_callback=img_cb)
 
-                x_samples_ddim = model.decode_first_stage(samples_ddim)
-                x_samples_ddim = torch.clamp((x_samples_ddim+1.0)/2.0,min=0.0, max=1.0)
-                gt_image = torch.clamp((gt_image+1.0)/2.0,min=0.0, max=1.0)
-                
-                all_samples.append(torch.cat([gt_image.detach().cpu(), x_samples_ddim.detach().cpu()], dim=0)) # put groundtruth at first
+                    x_samples_ddim = model.decode_first_stage(samples_ddim)
+                    x_samples_ddim = torch.clamp((x_samples_ddim+1.0)/2.0,min=0.0, max=1.0)
+                    gt_image = torch.clamp((gt_image+1.0)/2.0,min=0.0, max=1.0)
+                    all_samples.append(torch.cat([gt_image.detach().cpu(), x_samples_ddim.detach().cpu()], dim=0)) # put groundtruth at first
+                finally:
+                    if csm is not None and hasattr(csm, 'clear_batch_context'):
+                        csm.clear_batch_context()
         
         # Guard: return safe values when no samples (e.g. empty batch)
         if not all_samples:
@@ -573,6 +585,9 @@ class DDPM(pl.LightningModule):
         else:
             rank_zero_only(lambda: print(f'Stage B: skipping image generation during validation (epoch {current_epoch}).'))()
             self.log('val/skip_image_generation', 1.0, on_step=False, on_epoch=True)
+            # Avoid stale _last_val_samples from a previous epoch (would trigger heavy val metrics wrongly)
+            setattr(self, '_last_val_samples', None)
+            setattr(self, '_last_val_epoch', None)
         
         self.validation_count += 1
         if torch.cuda.is_available():
@@ -1158,20 +1173,27 @@ class LatentDiffusion(DDPM):
 
     def shared_step(self, batch, **kwargs):
         self.freeze_first_stage()
-        x, c, label, image_raw = self.get_input(batch, self.first_stage_key)
-        target_embeds = batch.get('target_embeds')
-        z_sem_gt = batch.get('z_sem_gt')
-        clip_img_embed_gt = batch.get('clip_img_embed_gt')
-        summary_embed_gt = batch.get('summary_embed_gt')
-        has_semantic_gt = batch.get('has_semantic_gt')
-        if self.return_cond:
-            loss, cc = self(x, c, label, image_raw, target_embeds=target_embeds, z_sem_gt=z_sem_gt,
+        csm = getattr(self, 'cond_stage_model', None)
+        if csm is not None and hasattr(csm, 'set_batch_context'):
+            csm.set_batch_context(batch)
+        try:
+            x, c, label, image_raw = self.get_input(batch, self.first_stage_key)
+            target_embeds = batch.get('target_embeds')
+            z_sem_gt = batch.get('z_sem_gt')
+            clip_img_embed_gt = batch.get('clip_img_embed_gt')
+            summary_embed_gt = batch.get('summary_embed_gt')
+            has_semantic_gt = batch.get('has_semantic_gt')
+            if self.return_cond:
+                loss, cc = self(x, c, label, image_raw, target_embeds=target_embeds, z_sem_gt=z_sem_gt,
+                                clip_img_embed_gt=clip_img_embed_gt, summary_embed_gt=summary_embed_gt, has_semantic_gt=has_semantic_gt)
+                return loss, cc
+            else:
+                loss = self(x, c, label, image_raw, target_embeds=target_embeds, z_sem_gt=z_sem_gt,
                             clip_img_embed_gt=clip_img_embed_gt, summary_embed_gt=summary_embed_gt, has_semantic_gt=has_semantic_gt)
-            return loss, cc
-        else:
-            loss = self(x, c, label, image_raw, target_embeds=target_embeds, z_sem_gt=z_sem_gt,
-                        clip_img_embed_gt=clip_img_embed_gt, summary_embed_gt=summary_embed_gt, has_semantic_gt=has_semantic_gt)
-            return loss
+                return loss
+        finally:
+            if csm is not None and hasattr(csm, 'clear_batch_context'):
+                csm.clear_batch_context()
 
     def forward(self, x, c, label, image_raw, target_embeds=None, z_sem_gt=None,
                 clip_img_embed_gt=None, summary_embed_gt=None, has_semantic_gt=None, *args, **kwargs):
@@ -1319,6 +1341,29 @@ class LatentDiffusion(DDPM):
                 loss_clip_weighted = lam_clip * loss_clip
                 loss += loss_clip_weighted
                 loss_dict.update({f'{prefix}/loss_clip': loss_clip_weighted})
+        # Optional: InfoNCE (CLIP space) — requires mapping + target_embeds; B>=2 recommended
+        main_cfg_ctr = getattr(self, 'main_config', None)
+        lam_ctr = getattr(main_cfg_ctr, 'lambda_contrast', 0.0) if main_cfg_ctr else 0.0
+        if (
+            lam_ctr > 0
+            and re_latent is not None
+            and target_embeds is not None
+            and hasattr(self.cond_stage_model, 'mapping')
+            and self.cond_stage_model.mapping is not None
+        ):
+            try:
+                from sarhm.sarhm_modules import pool_eeg_tokens
+                from semantic_losses_extra import infonce_clip_style
+                pooled = pool_eeg_tokens(re_latent, self.cond_stage_model.global_pool)
+                q = self.cond_stage_model.mapping(pooled)
+                k = target_embeds.to(q.device).float()
+                temp = float(getattr(main_cfg_ctr, 'contrast_temperature', 0.07))
+                if q.shape[0] > 1 and q.shape[0] == k.shape[0]:
+                    L_ctr = infonce_clip_style(q, k, temperature=temp)
+                    loss = loss + lam_ctr * L_ctr
+                    loss_dict.update({f'{prefix}/loss_contrast': L_ctr})
+            except Exception:
+                pass
         if self.cls_tune and re_latent is not None and hasattr(self.cond_stage_model, 'cls_net') and self.cond_stage_model.cls_net is not None:
             pre_cls = self.cond_stage_model.get_cls(re_latent)
             loss_cls = self.cls_loss(label, pre_cls)

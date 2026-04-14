@@ -50,6 +50,12 @@ class Config_MBM_EEG(Config_MAE_fMRI):
         self.include_kam = True
         self.accum_iter = 1
 
+        # Quasi-stationary preprocessing for MAE (optional; matches Config_Generative_Model when True)
+        self.use_quasi_stationary_windows = False
+        self.qs_num_windows = 64
+        self.qs_samples_per_window = 8
+        self.eeg_channel_target = 128
+
         self.use_nature_img_loss = False
         self.img_recon_weight = 0.5
         self.focus_range = None # [0, 1500] # None to disable it
@@ -118,6 +124,7 @@ class Config_Generative_Model:
         self.pretrain_mbm_path = str(_PRETRAIN_ROOT / 'eeg_pretain' / 'checkpoint.pth')
 
         self.img_size = 512
+        self.data_len = 512
 
         np.random.seed(self.seed)
         # finetune parameters (defaults from original config; for 16 GB GPU use --batch_size 4)
@@ -149,10 +156,10 @@ class Config_Generative_Model:
         self.test_gen_limit = 10
         # validate every N epochs
         self.check_val_every_n_epoch = 5
-        # Stage B correct-by-default: generate validation images when not disabled
-        self.disable_image_generation_in_val = False
-        # When image gen is enabled, generate every N epochs (1 = every val run)
-        self.val_image_gen_every_n_epoch = 1
+        # Stage B: skip validation image gen by default (saves GPU/time; use Stage C or --disable_image_generation_in_val false)
+        self.disable_image_generation_in_val = True
+        # When image gen is enabled (disable false), generate every N epochs; 0 = never
+        self.val_image_gen_every_n_epoch = 0
         # skip training for epochs < start_epoch (e.g. --start_epoch 2 to test epoch 2 only)
         self.start_epoch = 0
         # Debug toggles (minimal high-signal): conditioning stats, VAE round-trip, sampling intermediates
@@ -318,6 +325,43 @@ class Config_Generative_Model:
         self.no_retrieval_loss = False
         self.no_confidence_gate = False
         self.sarhmpp_projection_only = False  # SAR-HM++: use q_sem only (adapter from query), no retrieval
+
+        # ---------- Multi-dataset / domain (optional; backward compatible) ----------
+        # eeg_dataset_name: which loader to use in eeg_ldm.main — 'imagenet_eeg' | 'thoughtviz'
+        self.eeg_dataset_name = 'imagenet_eeg'
+        self.thoughtviz_eeg_path = None  # .pth with keys dataset/labels/images (same schema as ImageNet-EEG) or None
+        self.thoughtviz_images_root = None  # root folder for image paths in manifest
+        self.domain_id_default = 0  # 0=imagenet_eeg, 1=thoughtviz (for tags in batch)
+        # SAR-HM: separate prototype banks per domain (train/build per dataset; no cross-domain leakage)
+        self.use_domain_aware_sarhm = False
+        self.proto_path_imagenet_eeg = None
+        self.proto_path_thoughtviz = None
+        # Shortcuts: if set, override proto_path when domain matches (resolved in eeg_ldm)
+        self.fallback_domain_for_missing_bank = 'imagenet_eeg'
+
+        # ---------- Quasi-stationary temporal preprocessing (dataset + Stage A1) ----------
+        self.use_quasi_stationary_windows = False  # False = legacy global resample to data_len
+        self.qs_num_windows = 64
+        self.qs_samples_per_window = 8  # 64*8=512; must match data_len when product equals data_len
+        self.eeg_channel_target = 128  # pad/truncate raw channels to this (ImageNet-EEG default)
+
+        # ---------- EEG encoder architecture (Stage B / MAE checkpoint must match) ----------
+        # 'mae_vit' = existing eeg_encoder (default); 'local_cnn_global_vit' = optional hybrid (new module)
+        self.eeg_encoder_type = 'mae_vit'
+        self.eeg_hybrid_local_kernel = 7
+        self.eeg_hybrid_local_channels = (64, 128, 256)
+        self.eeg_hybrid_transformer_depth = 12
+        self.eeg_hybrid_num_heads = 8
+
+        # ---------- Semantic bridge & extra losses (optional; toggles default off for compat) ----------
+        self.use_semantic_bridge = False  # extra MLP on pooled EEG before mapping (train with CLIP/contrastive)
+        self.semantic_bridge_hidden = 1024
+        self.semantic_bridge_dropout = 0.1
+        self.lambda_contrast = 0.0  # InfoNCE EEG<->image embed when >0 and targets present
+        self.contrast_temperature = 0.07
+        self.lambda_clip_text_extra = 0.0  # extra text alignment (requires clip_text_embed in batch)
+        # Stage flags (documentation / CLI; training scripts may check these)
+        self.training_stage = 'stage_b'  # stage_a1 | semantic | stage_b | proto | sarhm | eval
 
 
 class Config_Cls_Model:
